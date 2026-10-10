@@ -14,6 +14,18 @@ import Foundation
         let fixture = #"{"snapshot":{"status":"signed_out","planLabel":null,"fetchedAtMs":null,"buckets":[],"updating":false,"tokens":{"trackingId":null,"chat":null,"chatErrorCode":null,"lifetimeTokens":null},"errorCode":"auth_required"},"standardUsd":null,"fastUsd":null,"priceDate":"2026-10-08"}"#
         let decoded = try JSONDecoder().decode(NativePayload.self, from: Data(fixture.utf8))
         precondition(decoded.snapshot.buckets.isEmpty && decoded.standardUsd == nil && decoded.snapshot.tokens.chat == nil)
-        print("Native data/format boundary checks passed.")
+        let resources = URL(fileURLWithPath: "/Applications/Example.app/Contents/Resources")
+        let home = URL(fileURLWithPath: "/Users/example")
+        let bundledNode = resources.appendingPathComponent("Runtime/node")
+        precondition(findNodeExecutable(resourceRoot: resources, home: home, isExecutable: { _ in true }) == bundledNode)
+        precondition(findNodeExecutable(resourceRoot: resources, home: home, isExecutable: { $0 == "/opt/homebrew/bin/node" })?.path == "/opt/homebrew/bin/node")
+        let sourceNode = home.appendingPathComponent(".cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node")
+        precondition(findNodeExecutable(resourceRoot: resources, home: home, isExecutable: { $0 == sourceNode.path }) == sourceNode)
+        precondition(findNodeExecutable(resourceRoot: resources, home: home, isExecutable: { _ in false }) == nil)
+        let path = backendExecutablePath(resourceRoot: resources, inheritedPath: "/usr/bin:/bin:/usr/local/bin:/custom/bin")
+        precondition(path == resources.appendingPathComponent("Runtime").path + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/custom/bin")
+        precondition(backendExecutablePath(resourceRoot: resources, inheritedPath: nil).hasSuffix(":/usr/bin:/bin:/usr/sbin:/sbin"))
+        precondition(!backendExecutablePath(resourceRoot: resources, inheritedPath: ":/usr/bin::").contains("::"))
+        print("Native data/format and runtime discovery checks passed.")
     }
 }

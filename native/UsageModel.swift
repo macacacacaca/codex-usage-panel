@@ -4,6 +4,21 @@ import Foundation
 
 enum PanelError: Error { case unavailable, incompatibleService, missingNode }
 
+func findNodeExecutable(resourceRoot: URL, home: URL,
+                        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> URL? {
+    let candidates = [resourceRoot.appendingPathComponent("Runtime/node").path,
+                      "/usr/local/bin/node", "/opt/homebrew/bin/node",
+                      home.appendingPathComponent(".cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node").path]
+    return candidates.first(where: isExecutable).map { URL(fileURLWithPath: $0) }
+}
+
+func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String {
+    let inherited = (inheritedPath ?? "/usr/bin:/bin:/usr/sbin:/sbin").split(separator: ":").map(String.init)
+    let paths = [resourceRoot.appendingPathComponent("Runtime").path, "/opt/homebrew/bin", "/usr/local/bin"] + inherited
+    var seen = Set<String>()
+    return paths.filter { seen.insert($0).inserted }.joined(separator: ":")
+}
+
 @MainActor final class BackendCoordinator {
     var process: Process?
     var log: FileHandle?
@@ -26,19 +41,20 @@ enum PanelError: Error { case unavailable, incompatibleService, missingNode }
         catch { /* No existing service: start the packaged read-only backend. */ }
         if process?.isRunning != true {
             let home = FileManager.default.homeDirectoryForCurrentUser
-            let candidates = ["/usr/local/bin/node", "/opt/homebrew/bin/node", home.appendingPathComponent(".cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node").path]
-            guard let node = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { throw PanelError.missingNode }
-            let serviceRoot = Bundle.main.resourceURL!.appendingPathComponent("Service")
+            let resourceRoot = Bundle.main.resourceURL!
+            guard let node = findNodeExecutable(resourceRoot: resourceRoot, home: home) else { throw PanelError.missingNode }
+            let serviceRoot = resourceRoot.appendingPathComponent("Service")
             let runtime = home.appendingPathComponent("Library/Application Support/CodexUsage/runtime")
             try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let logURL = runtime.appendingPathComponent("service.log")
             if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
             log = try FileHandle(forWritingTo: logURL); try log?.seekToEnd()
             let child = Process()
-            child.executableURL = URL(fileURLWithPath: node)
+            child.executableURL = node
             child.arguments = ["src/server.ts"]
             child.currentDirectoryURL = serviceRoot
             var environment = ProcessInfo.processInfo.environment
+            environment["PATH"] = backendExecutablePath(resourceRoot: resourceRoot, inheritedPath: environment["PATH"])
             environment["PORT"] = "4317"
             environment["CODEX_USAGE_RUNTIME_DIR"] = runtime.path
             child.environment = environment

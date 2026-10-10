@@ -25,7 +25,7 @@ const temporary = await mkdtemp(join(tmpdir(), 'codex-usage-secrets-'));
 try {
   const filename = `gitleaks_${version}_${distribution}.tar.gz`;
   const archivePath = join(temporary, filename);
-  execFileSync('curl', ['--fail', '--location', '--silent', '--show-error', '--proto', '=https', '--proto-redir', '=https', '--connect-timeout', '10', '--max-time', '180', '--output', archivePath,
+  execFileSync('curl', ['--fail', '--location', '--silent', '--show-error', '--proto', '=https', '--proto-redir', '=https', '--connect-timeout', '10', '--max-time', '600', '--output', archivePath,
     `https://github.com/gitleaks/gitleaks/releases/download/v${version}/${filename}`], { stdio: 'inherit' });
   const archive = await readFile(archivePath);
   if (createHash('sha256').update(archive).digest('hex') !== expected) throw new Error('Scanner checksum mismatch.');

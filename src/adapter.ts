@@ -1,19 +1,33 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
+import { accessSync, constants, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 export class AdapterError extends Error {
   code: string;
   constructor(code: string) { super(code); this.code = code; }
 }
 
-export function findCodex(): string {
-  if (process.env.CODEX_BINARY) return process.env.CODEX_BINARY;
+function isExecutableFile(path: string): boolean {
+  try { accessSync(path, constants.X_OK); return statSync(path).isFile(); }
+  catch { return false; }
+}
+
+export function findCodex({ home = homedir(), environment = process.env, isExecutable = isExecutableFile }:
+  { home?: string; environment?: NodeJS.ProcessEnv; isExecutable?: (path: string) => boolean } = {}): string {
+  if (environment.CODEX_BINARY) return environment.CODEX_BINARY;
   for (const path of [
     '/Applications/Codex.app/Contents/Resources/codex',
     '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-  ]) if (existsSync(path)) return path;
+    join(home, 'Applications/Codex.app/Contents/Resources/codex'),
+    join(home, 'Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'),
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    join(home, '.npm-global/bin/codex'),
+    join(home, '.local/bin/codex'),
+  ]) if (isExecutable(path)) return path;
   return 'codex';
 }
 

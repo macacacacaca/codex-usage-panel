@@ -10,10 +10,11 @@
 </p>
 
 <p align="center">
-  <strong>macOS 13+</strong> &nbsp;·&nbsp; SwiftUI + AppKit &nbsp;·&nbsp; Apple Silicon + Intel
+  <strong>macOS 13.5+</strong> &nbsp;·&nbsp; SwiftUI + AppKit &nbsp;·&nbsp; Apple Silicon + Intel
 </p>
 
 <p align="center">
+  <a href="https://github.com/macacacacaca/codex-usage-panel/releases/latest"><strong>Download for macOS</strong></a> &nbsp; / &nbsp;
   <a href="#quick-start">Quick start</a> &nbsp; / &nbsp;
   <a href="#the-panel">The panel</a> &nbsp; / &nbsp;
   <a href="docs/guide.md">User guide</a> &nbsp; / &nbsp;
@@ -44,18 +45,38 @@ The USD equivalent uses API pricing. **It is an estimate, not a ChatGPT/Codex su
 
 ## Quick start
 
-### 1. Prepare your Mac
+### 1. Download for your Mac
+
+| Your Mac | Download v0.3.2 |
+| :--- | :--- |
+| Apple Silicon — M1, M2, M3, M4, or later | [Apple Silicon app · arm64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.2/CodexUsage-v0.3.2-macos-arm64.zip) |
+| Intel | [Intel app · x86_64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.2/CodexUsage-v0.3.2-macos-x86_64.zip) |
+
+Requires **macOS 13.5 or later** and an installed **Codex app or CLI signed in with ChatGPT**. Release apps include Node.js **24.21.0** and the local data service; you do not need Node.js, npm, or Apple Command Line Tools to run them. Codex itself is not bundled. Find checksums and release notes on the [Releases page](https://github.com/macacacacaca/codex-usage-panel/releases/latest).
+
+### 2. Unzip, move, and open
+
+1. Unzip the download and drag **CodexUsage.app** to **Applications**.
+2. Open the app. Its two rows of percentages appear in the menu bar, with no Dock icon or terminal required.
+3. This release is **ad hoc signed, without a Developer ID signature or Apple notarization**. If macOS blocks the first launch, use **System Settings → Privacy & Security → Open Anyway** after trying to open it, then confirm **Open** only if you trust this download. See [Apple's opening guidance](https://support.apple.com/102445).
+
+### 3. Choose a chat
+
+Open settings in the panel's upper-right corner and paste a chat ID from a `codex://threads/<ID>` link. The app remembers your selection. Leave the field blank to stop tracking. Release packages contain **no saved chat ID, credentials, or personal runtime settings**.
+
+The panel tracks **one selected chat**; switching chats in Codex does not change it automatically. It runs as a standalone macOS app, with a Traditional Chinese interface and Taipei time.
+
+<details>
+<summary><strong>Prefer to build from source?</strong></summary>
+
+Along with macOS 13.5+ and Codex sign-in, source builds require:
 
 | Requirement | Version or setup |
 | :--- | :--- |
-| macOS | **13 or later** |
 | Node.js | **22.18 or later** |
 | Apple Command Line Tools | Swift; install with `xcode-select --install` |
-| Codex CLI | Signed in with ChatGPT using `codex login`, or an existing local Codex/ChatGPT app sign-in |
 
 There are **no third-party npm dependencies**. You can build directly without running `npm install`.
-
-### 2. Build and open
 
 ```sh
 git clone https://github.com/macacacacaca/codex-usage-panel.git
@@ -64,22 +85,18 @@ npm run build:native
 open outputs/CodexUsage.app
 ```
 
-The build creates an app for your Mac's architecture with an ad hoc signature. The panel opens on launch, runs without a Dock icon, and does not require an open terminal or browser.
+The build creates an ad hoc signed app for your Mac's architecture. A regular source build uses your installed Node.js; downloadable releases bundle their own runtime. See [development and release packaging](./docs/development.md) for details.
 
-### 3. Choose a chat
-
-Open settings in the panel's upper-right corner and paste a chat ID from a `codex://threads/<ID>` link. The app remembers your selection. Leave the field blank to stop tracking.
-
-The panel tracks **one selected chat**; switching chats in Codex does not change it automatically. It runs as a standalone macOS app, with a Traditional Chinese interface and Taipei time.
+</details>
 
 ## Everyday use
 
 - **Open or close:** click the menu bar percentages. Escape or the × button closes the panel.
 - **See token details:** click the token card. Use the back button to return.
 - **Adjust pricing:** select API Standard or Fast in settings. This changes the estimate's pricing scenario.
-- **Quit:** choose Quit in settings, right-click the menu bar indicator, or use the [stop script](./停止用量面板.command).
+- **Quit:** choose Quit in settings or right-click the menu bar indicator.
 
-You can also use the [launch script](./啟動用量面板.command), which builds the app on first use. Account limits refresh every **60 seconds**; local chat tokens update every **10 seconds**. Automatic launch at login is not configured.
+Account limits refresh every **60 seconds**; local chat tokens update every **10 seconds**. Automatic launch at login is not configured. Source users can also use the [launch script](./啟動用量面板.command), which builds on first use, and the [stop script](./停止用量面板.command).
 
 If the menu bar is crowded, switch to Finder, then hold **⌘** and drag the indicator toward the clock. See the [full usage guide](./docs/guide.md#launch-and-quit) for service management and menu bar limitations.
 

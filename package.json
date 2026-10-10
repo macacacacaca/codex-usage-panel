@@ -1,12 +1,13 @@
 {
   "name": "codex-usage-panel",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.18.0" },
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:native": "node scripts/build-native.mjs",
+    "release:build": "node scripts/build-release.mjs",
     "start": "node scripts/build.mjs && node src/server.ts",
     "stop": "node scripts/stop.mjs",
     "demo": "node scripts/build.mjs && node src/server.ts --demo",
