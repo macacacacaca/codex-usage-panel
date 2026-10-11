@@ -34,7 +34,7 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
             let (data, response) = try await session.data(from: base.appendingPathComponent("health"))
             if (response as? HTTPURLResponse)?.statusCode == 200 {
                 let health = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                guard (health?["version"] as? String)?.hasPrefix("0.3.") == true else { throw PanelError.incompatibleService }
+                guard (health?["apiVersion"] as? Int) == 2 else { throw PanelError.incompatibleService }
                 return
             }
         } catch PanelError.incompatibleService { throw PanelError.incompatibleService }
@@ -114,7 +114,7 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
     }
     func window(_ slot: String) -> UsageWindow? { bucket?.windows.first(where: { $0.slot == slot }) }
     var tooltip: String {
-        "Codex 用量（剩餘）\n上行：短期 \(percentage(window("primary")?.remainingPercent))\n下行：每週 \(percentage(window("secondary")?.remainingPercent))\n聊天 Token \(compactTokens(snapshot?.tokens.chat?.totalTokens)) · \(dollarText(usd)) API 等值\n\(status)\n點一下展開；右鍵可退出"
+        "Codex 用量（剩餘）\n上行：短期 \(percentage(window("primary")?.remainingPercent))\n下行：每週 \(percentage(window("secondary")?.remainingPercent))\n帳號 Token \(compactTokens(snapshot?.tokens.lifetimeTokens ?? snapshot?.tokens.account?.totalTokens)) · \(dollarText(usd)) 本機 API 等值\n\(status)\n點一下展開；右鍵可退出"
     }
     func start() {
         timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in

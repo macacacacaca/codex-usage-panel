@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CodexAdapter, AdapterError } from '../src/adapter.ts';
 import { UsageService } from '../src/service.ts';
-import type { ChatTokens } from '../src/tokens.ts';
+import type { AccountTokens, ChatTokens } from '../src/tokens.ts';
+
+const emptyAccountReader = { async read() { return { account: null, errorCode: 'no_token_events' }; } };
 
 class FakeAdapter extends CodexAdapter {
   reads = 0; rates = 0; closes = 0;
@@ -34,7 +36,7 @@ class FakeAdapter extends CodexAdapter {
 test('concurrent panels/manual refresh share one read, failures retain the verified snapshot, recovery resets backoff', async () => {
   const adapter = new FakeAdapter();
   let release!: () => void; adapter.gate = new Promise(resolve => release = resolve);
-  let now = 1000; const service = new UsageService({ adapter, now: () => now, random: () => 0 });
+  let now = 1000; const service = new UsageService({ accountReader: emptyAccountReader, adapter, now: () => now, random: () => 0 });
   try {
     const first = service.refresh(), second = service.refresh(); assert.equal(first, second);
     await new Promise(resolve => setImmediate(resolve)); release(); await first;
@@ -49,7 +51,7 @@ test('concurrent panels/manual refresh share one read, failures retain the verif
   } finally { await service.close(); }
 });
 test('account change during a read discards the response and clears old snapshot', async () => {
-  const adapter = new FakeAdapter(); const service = new UsageService({ adapter });
+  const adapter = new FakeAdapter(); const service = new UsageService({ accountReader: emptyAccountReader, adapter });
   try {
     await service.refresh();
     adapter.onRate = () => { adapter.email = 'other@example.com'; };
@@ -62,7 +64,7 @@ test('account change during a read discards the response and clears old snapshot
   } finally { await service.close(); }
 });
 test('auth notification invalidates in-flight results; sign-out and unsupported auth hide previous numbers', async () => {
-  const adapter = new FakeAdapter(); const service = new UsageService({ adapter });
+  const adapter = new FakeAdapter(); const service = new UsageService({ accountReader: emptyAccountReader, adapter });
   try {
     await service.refresh();
     adapter.onRate = () => { adapter.emit('account/updated', { authMode: null }); };
@@ -73,7 +75,7 @@ test('auth notification invalidates in-flight results; sign-out and unsupported 
   } finally { await service.close(); }
 });
 test('unconfirmable auth clears cache even on network failure; polling follows visibility and selected interval', async () => {
-  const adapter = new FakeAdapter(); let now = 1000; const service = new UsageService({ adapter, now: () => now });
+  const adapter = new FakeAdapter(); let now = 1000; const service = new UsageService({ accountReader: emptyAccountReader, adapter, now: () => now });
   try {
     await service.refresh();
     service.setPanel('one', true, 60); service.setPanel('two', true, 30);
@@ -90,7 +92,7 @@ test('unconfirmable auth clears cache even on network failure; polling follows v
 
 test('reset boundary refetches once without refilling quota, and wake triggers a fresh read', async () => {
   const adapter = new FakeAdapter(); let now = 999_000;
-  const service = new UsageService({ adapter, now: () => now });
+  const service = new UsageService({ accountReader: emptyAccountReader, adapter, now: () => now });
   try {
     await service.refresh(); service.lastTick = now;
     now = 1_000_001; service.tick(); await service.inFlight;
@@ -104,7 +106,7 @@ test('reset boundary refetches once without refilling quota, and wake triggers a
 
 test('identity verification failure after usage read clears data; disconnected process uses backoff', async () => {
   const adapter = new FakeAdapter(); let now = 1000;
-  const service = new UsageService({ adapter, now: () => now, random: () => 0 });
+  const service = new UsageService({ accountReader: emptyAccountReader, adapter, now: () => now, random: () => 0 });
   try {
     await service.refresh(); adapter.failAfter = true; now = 2000;
     await service.refresh(); assert.equal(service.snapshot.buckets.length, 0);
@@ -120,9 +122,10 @@ test('identity verification failure after usage read clears data; disconnected p
 const trackedA = '11111111-2222-3333-4444-555555555555';
 const trackedB = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const fakeChat = (total: number): ChatTokens => ({ inputTokens: total, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: total, segments: [{ model: 'gpt-6.1-sol', longContext: false, inputTokens: total, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: total }], updatedAtMs: 1000, complete: true });
+const fakeAccount = (total: number, sessionCount = 1): AccountTokens => ({ ...fakeChat(total), sessionCount });
 test('optional token history failure retains quota and same-account history, but an account switch clears it', async () => {
   const adapter = new FakeAdapter();
-  const service = new UsageService({ adapter, trackingId: trackedA, localReader: { async read(_id, account) { return account === 'account-a' ? { chat: fakeChat(100), errorCode: null } : { chat: null, errorCode: 'log_identity_mismatch' }; } } });
+  const service = new UsageService({ accountReader: emptyAccountReader, adapter, trackingId: trackedA, localReader: { async read(_id, account) { return account === 'account-a' ? { chat: fakeChat(100), errorCode: null } : { chat: null, errorCode: 'log_identity_mismatch' }; } } });
   try {
     await service.refresh(); assert.equal(service.snapshot.tokens.lifetimeTokens, 100); assert.equal(service.snapshot.tokens.chat?.totalTokens, 100);
     adapter.tokenFailure = true; await service.refresh();
@@ -135,7 +138,7 @@ test('optional token history failure retains quota and same-account history, but
 });
 test('local polling does not request account history or change quota timestamp; tracking changes discard in-flight logs', async () => {
   const adapter = new FakeAdapter(); let now = 1000, total = 100, gate: Promise<void> | null = null;
-  const service = new UsageService({ adapter, now: () => now, trackingId: trackedA, localReader: { async read(id) { if (gate) await gate; return { chat: fakeChat(id === trackedB ? 200 : total), errorCode: null }; } } });
+  const service = new UsageService({ accountReader: emptyAccountReader, adapter, now: () => now, trackingId: trackedA, localReader: { async read(id) { if (gate) await gate; return { chat: fakeChat(id === trackedB ? 200 : total), errorCode: null }; } } });
   try {
     await service.refresh(); const reads = adapter.tokenReads;
     now = 11000; service.lastTick = 1000; total = 150; service.tick(); await service.localInFlight;
@@ -145,5 +148,101 @@ test('local polling does not request account history or change quota timestamp; 
     assert.equal(service.snapshot.tokens.chat, null); release(); await reading; await changing; gate = null;
     assert.equal(service.snapshot.tokens.trackingId, trackedB); assert.equal(service.snapshot.tokens.chat?.totalTokens, 200);
     await service.setTrackingId(null); assert.equal(service.snapshot.tokens.trackingId, null);
+  } finally { await service.close(); }
+});
+
+test('account-wide local tokens update without a tracked chat or additional account API polling, and switch accounts safely', async () => {
+  const adapter = new FakeAdapter(); let now = 1000, total = 40, sessionCount = 2;
+  const accounts: string[] = []; let chatReads = 0;
+  const service = new UsageService({ adapter, now: () => now,
+    localReader: { async read() { chatReads++; return { chat: fakeChat(999), errorCode: null }; } },
+    accountReader: { async read(accountId) { accounts.push(accountId); return { account: fakeAccount(accountId === 'account-a' ? total : 20, accountId === 'account-a' ? sessionCount : 1), errorCode: null }; } },
+  });
+  try {
+    await service.refresh();
+    assert.equal(service.snapshot.tokens.trackingId, null); assert.equal(service.snapshot.tokens.chat, null);
+    assert.equal(service.snapshot.tokens.account?.totalTokens, 40); assert.equal(service.snapshot.tokens.account?.sessionCount, 2);
+    assert.equal(service.snapshot.tokens.lifetimeTokens, 100); assert.equal(chatReads, 0);
+    const apiReads = [adapter.reads, adapter.rates, adapter.tokenReads];
+    now = 11000; service.lastTick = 1000; total = 75; sessionCount = 3; service.tick(); await service.localInFlight;
+    assert.equal(service.snapshot.tokens.account?.totalTokens, 75);
+    assert.equal(service.snapshot.tokens.account?.sessionCount, 3);
+    assert.equal(service.snapshot.fetchedAtMs, 1000); assert.equal(service.snapshot.tokens.fetchedAtMs, 1000);
+    assert.deepEqual([adapter.reads, adapter.rates, adapter.tokenReads], apiReads);
+    const previous = service.getSnapshot();
+    adapter.email = 'other@example.com'; adapter.accountId = 'account-b'; await service.refresh();
+    assert.equal(service.snapshot.tokens.account?.totalTokens, 20); assert.equal(service.snapshot.tokens.lifetimeTokens, 200);
+    assert.equal(service.snapshot.tokens.accountErrorCode, null); assert.equal(previous.tokens.account?.totalTokens, 75);
+    assert.deepEqual(accounts, ['account-a', 'account-a', 'account-b']);
+    adapter.type = 'signed_out'; await service.refresh();
+    assert.equal(service.snapshot.status, 'signed_out'); assert.equal(service.snapshot.tokens.account, null);
+    assert.equal(service.snapshot.tokens.lifetimeTokens, null);
+  } finally { await service.close(); }
+});
+
+test('in-flight account aggregates cannot republish after an account switch or sign-out', async () => {
+  const adapter = new FakeAdapter(); let gate: Promise<void> | null = null;
+  let release = () => {}; let accountATotal = 40, accountBTotal = 20;
+  const published: Array<number | null> = [];
+  const service = new UsageService({ adapter,
+    accountReader: { async read(accountId) {
+      const account = fakeAccount(accountId === 'account-a' ? accountATotal : accountBTotal);
+      if (gate) await gate;
+      return { account, errorCode: null };
+    } },
+  });
+  service.on('snapshot', snapshot => published.push(snapshot.tokens.account?.totalTokens ?? null));
+  try {
+    await service.refresh(); assert.equal(service.snapshot.tokens.account?.totalTokens, 40);
+    gate = new Promise<void>(resolve => release = resolve); accountATotal = 500;
+    const staleA = service.refreshLocalTokens(); await new Promise(resolve => setImmediate(resolve));
+    adapter.email = 'other@example.com'; adapter.accountId = 'account-b';
+    const switching = service.refresh(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(service.sourceAccountId, 'account-b'); assert.equal(service.snapshot.tokens.account, null);
+    release(); gate = null; await staleA; await switching;
+    assert.equal(service.snapshot.tokens.account?.totalTokens, 20); assert.equal(published.includes(500), false);
+
+    gate = new Promise<void>(resolve => release = resolve); accountBTotal = 400;
+    const staleB = service.refreshLocalTokens(); await new Promise(resolve => setImmediate(resolve));
+    adapter.type = 'signed_out'; await service.refresh();
+    assert.equal(service.snapshot.status, 'signed_out'); assert.equal(service.snapshot.tokens.account, null);
+    release(); gate = null; await staleB;
+    assert.equal(service.snapshot.tokens.account, null); assert.equal(published.includes(400), false);
+  } finally { release(); gate = null; await service.close(); }
+});
+
+test('snapshots and injected reader results do not alias mutable account or chat token data', async () => {
+  const adapter = new FakeAdapter(); const account = fakeAccount(40), chat = fakeChat(20);
+  const service = new UsageService({ adapter, trackingId: trackedA,
+    localReader: { async read() { return { chat, errorCode: null }; } },
+    accountReader: { async read() { return { account, errorCode: null }; } },
+  });
+  try {
+    const snapshot = await service.refresh();
+    snapshot.tokens.account!.totalTokens = 999; snapshot.tokens.account!.segments[0].totalTokens = 999;
+    snapshot.tokens.chat!.totalTokens = 999; snapshot.tokens.dailyBuckets[0].tokens = 999;
+    snapshot.buckets[0].windows[0].remainingPercent = 0;
+    account.totalTokens = 888; account.segments[0].totalTokens = 888;
+    chat.totalTokens = 888; chat.segments[0].totalTokens = 888;
+    const retained = service.getSnapshot();
+    assert.equal(retained.tokens.account?.totalTokens, 40); assert.equal(retained.tokens.account?.segments[0].totalTokens, 40);
+    assert.equal(retained.tokens.chat?.totalTokens, 20); assert.equal(retained.tokens.chat?.segments[0].totalTokens, 20);
+    assert.equal(retained.tokens.dailyBuckets[0].tokens, 10); assert.equal(retained.buckets[0].windows[0].remainingPercent, 76);
+  } finally { await service.close(); }
+});
+
+test('an account log read failure clears its aggregate without hiding verified quota or official history', async () => {
+  const adapter = new FakeAdapter(); let unavailable = false;
+  const service = new UsageService({ adapter,
+    accountReader: { async read() {
+      if (unavailable) throw new Error('unavailable');
+      return { account: fakeAccount(40), errorCode: null };
+    } },
+  });
+  try {
+    await service.refresh(); unavailable = true; await service.refreshLocalTokens();
+    assert.equal(service.snapshot.tokens.account, null); assert.equal(service.snapshot.tokens.accountErrorCode, 'log_unavailable');
+    assert.equal(service.snapshot.status, 'ready'); assert.equal(service.snapshot.tokens.lifetimeTokens, 100);
+    assert.equal(adapter.rates, 1); assert.equal(adapter.tokenReads, 1);
   } finally { await service.close(); }
 });

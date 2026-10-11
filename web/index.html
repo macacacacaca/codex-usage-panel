@@ -44,9 +44,9 @@
           <div class="reset"><p id="secondary-countdown">重置時間未提供</p><time id="secondary-time">—</time></div>
         </article>
       </div>
-      <section class="token-strip" aria-label="追蹤聊天的 Token 與美元等值">
-        <div><h2>聊天累計 Token</h2><p class="token-number" id="token-total">—</p></div>
-        <div><h2>美元等值估算</h2><p class="token-number" id="token-usd">—</p></div>
+      <section class="token-strip" aria-label="目前帳號的 Token 與本機美元等值">
+        <div><h2>帳號累計 Token</h2><p class="token-number" id="token-total">—</p></div>
+        <div><h2>本機美元等值估算</h2><p class="token-number" id="token-usd">—</p></div>
         <p class="token-note" id="token-note">API Standard 等值 · 非帳單</p>
       </section>
       <footer class="footer"><p id="updated">尚未取得用量資料</p><span id="frequency">每 60 秒更新</span></footer>
@@ -59,9 +59,7 @@
     <label class="setting"><span>時區</span><select id="timezone"></select></label>
     <label class="setting"><span>更新週期</span><select id="interval"><option value="30">每 30 秒</option><option value="60">每 60 秒</option><option value="120">每 120 秒</option></select></label>
     <label class="setting"><span>美元換算方式</span><select id="pricing"><option value="standard">API Standard 單價</option><option value="fast">API Fast 單價（2 倍）</option></select></label>
-    <label class="setting"><span>追蹤聊天 ID</span><input id="tracking" type="text" maxlength="36" spellcheck="false" autocomplete="off" placeholder="貼上聊天 ID；留空停止追蹤" aria-describedby="tracking-help tracking-status"></label>
-    <p id="tracking-help" class="setting-note">追蹤固定的一個聊天，切換聊天不會自動改變。此 ID 會儲存在本機服務；Token 不會另存。</p>
-    <button id="save-tracking" class="secondary-button" type="button">儲存追蹤聊天</button><p id="tracking-status" class="setting-note" role="status"></p>
+    <p class="setting-note">自動跟隨目前登入帳號，本機聊天每 10 秒加總，不需設定聊天 ID。官方帳號總量可能較晚更新。</p>
     <p class="setting-note">設定會儲存在這個瀏覽器。面板隱藏超過 1 分鐘後，改為每 5 分鐘更新。</p>
     <button id="done" type="button" class="primary-button">完成</button>
   </dialog>

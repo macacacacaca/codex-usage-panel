@@ -6,13 +6,15 @@ export type TokenSegment = Counters & { model: string | null; longContext: boole
 export type ChatTokens = Counters & {
   segments: TokenSegment[]; updatedAtMs: number | null; complete: boolean;
 };
+export type AccountTokens = ChatTokens & { sessionCount: number };
 export type TokenProfile = {
   trackingId: string | null; chat: ChatTokens | null; chatErrorCode: string | null;
+  account: AccountTokens | null; accountErrorCode: string | null;
   lifetimeTokens: number | null; dailyBuckets: Array<{ date: string; tokens: number }>;
   fetchedAtMs: number | null; errorCode: string | null;
 };
 export function emptyTokens(trackingId: string | null = null): TokenProfile {
-  return { trackingId, chat: null, chatErrorCode: null, lifetimeTokens: null, dailyBuckets: [], fetchedAtMs: null, errorCode: null };
+  return { trackingId, chat: null, chatErrorCode: null, account: null, accountErrorCode: null, lifetimeTokens: null, dailyBuckets: [], fetchedAtMs: null, errorCode: null };
 }
 export function counter(value: unknown): number | null {
   if (typeof value === 'bigint' && value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(value);

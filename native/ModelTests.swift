@@ -14,6 +14,9 @@ import Foundation
         let fixture = #"{"snapshot":{"status":"signed_out","planLabel":null,"fetchedAtMs":null,"buckets":[],"updating":false,"tokens":{"trackingId":null,"chat":null,"chatErrorCode":null,"lifetimeTokens":null},"errorCode":"auth_required"},"standardUsd":null,"fastUsd":null,"priceDate":"2026-10-08"}"#
         let decoded = try JSONDecoder().decode(NativePayload.self, from: Data(fixture.utf8))
         precondition(decoded.snapshot.buckets.isEmpty && decoded.standardUsd == nil && decoded.snapshot.tokens.chat == nil)
+        let accountFixture = #"{"trackingId":null,"chat":null,"chatErrorCode":null,"lifetimeTokens":1000,"account":{"inputTokens":100,"cachedInputTokens":50,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5,"totalTokens":120,"updatedAtMs":1000,"complete":true,"sessionCount":2},"accountErrorCode":null}"#
+        let account = try JSONDecoder().decode(TokenProfile.self, from: Data(accountFixture.utf8))
+        precondition(account.account?.sessionCount == 2 && account.account?.totalTokens == 120 && account.lifetimeTokens == 1000)
         let resources = URL(fileURLWithPath: "/Applications/Example.app/Contents/Resources")
         let home = URL(fileURLWithPath: "/Users/example")
         let bundledNode = resources.appendingPathComponent("Runtime/node")

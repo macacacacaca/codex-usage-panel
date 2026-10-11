@@ -102,13 +102,14 @@ function render() {
   text('updated', formatted ? `最後成功更新 ${previousDay ? new Intl.DateTimeFormat('zh-TW', { timeZone: settings.timeZone, month: '2-digit', day: '2-digit' }).format(snapshot.fetchedAtMs!) + ' ' : ''}${formatted}` : '尚未取得用量資料');
   text('frequency', document.hidden ? '背景每 5 分鐘更新' : `每 ${settings.interval} 秒更新`);
   renderRecovery();
-  const tokens = snapshot.tokens, chat = tokens.chat, usd = estimateUsd(chat, settings.pricing);
-  text('token-total', tokenText(chat?.totalTokens ?? null));
-  $('token-total').title = chat ? `${chat.totalTokens.toLocaleString('en-US')} tokens` : '尚無聊天 Token 紀錄';
+  const tokens = snapshot.tokens, chat = tokens.account, usd = estimateUsd(chat, settings.pricing);
+  const total = tokens.lifetimeTokens ?? chat?.totalTokens ?? null;
+  text('token-total', tokenText(total));
+  $('token-total').title = total !== null ? `${total.toLocaleString('en-US')} tokens（${tokens.lifetimeTokens !== null ? '官方帳號累計' : '本機帳號紀錄'}）` : '尚無帳號 Token 紀錄';
   text('token-usd', usdText(usd));
   $('token-usd').title = usd === null ? '缺少完整模型或 Token 拆分，暫不估價' : `US$${usd.toFixed(6)}（API 單價等值）`;
-  const tokenError = { no_tracked_thread: '可在設定選擇追蹤聊天', log_unavailable: '找不到追蹤聊天紀錄', log_identity_mismatch: '無法確認紀錄屬於目前帳號', no_token_events: '追蹤聊天尚無 Token 紀錄' }[tokens.chatErrorCode ?? ''];
-  text('token-note', chat ? `API ${settings.pricing === 'fast' ? 'Fast' : 'Standard'} 等值 · 非帳單${usd === null ? ' · 單價資料不足' : ''}${snapshot.status === 'offline' ? ' · 上次資料' : ''}` : tokenError ?? (snapshot.updating ? '正在讀取聊天 Token…' : '尚未取得聊天 Token'));
+  const tokenError = { no_account_logs: '目前帳號尚無可核對的本機紀錄', no_token_events: '目前帳號尚無可核對的本機紀錄', log_unavailable: '暫時無法讀取本機紀錄', account_logs_incomplete: '部分紀錄無法完整核對' }[tokens.accountErrorCode ?? ''];
+  text('token-note', chat ? `${tokens.lifetimeTokens !== null ? '官方累計' : '本機累計'} · 本機 API ${settings.pricing === 'fast' ? 'Fast' : 'Standard'} 等值 · 非帳單${usd === null ? ' · 資料不足' : ''}${snapshot.status === 'offline' ? ' · 上次資料' : ''}` : tokenError ?? '正在取得目前帳號的本機 Token');
   const newDetailSignature = JSON.stringify([current, snapshot.resetCreditsAvailable, snapshot.status, tokens, settings.pricing, settings.timeZone]);
   if (detailSignature !== newDetailSignature) {
     detailSignature = newDetailSignature;
@@ -121,7 +122,7 @@ function render() {
     if (snapshot.resetCreditsAvailable !== null) fields.push(['可用重置次數', `${snapshot.resetCreditsAvailable} 次（只讀）`]);
     const count = (n: number) => n.toLocaleString('en-US');
     if (chat) {
-      fields.push(['聊天 · 一般輸入', count(chat.inputTokens - chat.cachedInputTokens - chat.cacheWriteInputTokens)], ['聊天 · 快取輸入', count(chat.cachedInputTokens)], ['聊天 · 快取寫入', count(chat.cacheWriteInputTokens)], ['聊天 · 輸出', count(chat.outputTokens)], ['其中推理輸出', count(chat.reasoningOutputTokens)], ['聊天 · Token 總計', count(chat.totalTokens)]);
+      fields.push(['目前帳號 · 本機聊天數', count(chat.sessionCount)], ['本機 · 一般輸入', count(chat.inputTokens - chat.cachedInputTokens - chat.cacheWriteInputTokens)], ['本機 · 快取輸入', count(chat.cachedInputTokens)], ['本機 · 快取寫入', count(chat.cacheWriteInputTokens)], ['本機 · 輸出', count(chat.outputTokens)], ['其中推理輸出', count(chat.reasoningOutputTokens)], ['本機 · Token 總計', count(chat.totalTokens)]);
       fields.push(['Token 紀錄時間', chat.updatedAtMs === null ? '未提供' : absoluteTime(chat.updatedAtMs, settings.timeZone)]);
       const models = [...new Set(chat.segments.map(segment => segment.model ?? '未提供'))];
       fields.push(['紀錄中的模型', models.join('、')], ['估價方式', `API ${settings.pricing === 'fast' ? 'Fast（Standard × 2）' : 'Standard'}`]);
@@ -131,7 +132,8 @@ function render() {
       }
       fields.push(['單價核對日期', PRICE_CHECKED_DATE], ['長上下文計價', '單次輸入 > 272K：輸入與快取 × 2、輸出 × 1.5']);
       if (usd === null) fields.push(['美元估算', '模型、單次請求或拆分不完整，暫不估價']);
-    } else fields.push(['聊天 Token', tokenError ?? '尚未取得紀錄']);
+    } else fields.push(['本機帳號 Token', tokenError ?? '尚未取得紀錄']);
+    fields.push(['Token 明細範圍', '目前帳號在這台 Mac 的紀錄；其他裝置僅可能反映在官方帳號總量']);
     if (tokens.lifetimeTokens !== null) fields.push(['帳號 · 歷史累計 Token', count(tokens.lifetimeTokens)]);
     const latest = tokens.dailyBuckets.at(-1);
     if (latest) fields.push([`帳號 · ${latest.date}（來源日期）`, count(latest.tokens)]);
@@ -179,10 +181,7 @@ function connect() {
 
 $('refresh').addEventListener('click', () => void refresh());
 $('retry').addEventListener('click', () => void refresh());
-$('settings').addEventListener('click', () => {
-  $<HTMLInputElement>('tracking').value = snapshot.tokens.trackingId ?? '';
-  text('tracking-status', ''); dialog.showModal();
-});
+$('settings').addEventListener('click', () => dialog.showModal());
 $('done').addEventListener('click', () => dialog.close());
 $('close-settings').addEventListener('click', () => dialog.close());
 $('bucket').addEventListener('change', event => { selectedBucket = (event.target as HTMLSelectElement).value; render(); });
@@ -195,14 +194,6 @@ $<HTMLSelectElement>('pricing').value = settings.pricing;
 for (const id of ['theme', 'timezone', 'interval', 'pricing']) $(id).addEventListener('change', () => {
   settings = { theme: $<HTMLSelectElement>('theme').value as Settings['theme'], timeZone: $<HTMLSelectElement>('timezone').value, interval: Number($<HTMLSelectElement>('interval').value), pricing: $<HTMLSelectElement>('pricing').value as Settings['pricing'] };
   applySettings(); void presence();
-});
-$('save-tracking').addEventListener('click', async () => {
-  const id = $<HTMLInputElement>('tracking').value.trim();
-  if (id && !/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(id)) { text('tracking-status', '請輸入完整的聊天 ID（36 個字元）。'); return; }
-  const button = $<HTMLButtonElement>('save-tracking'); button.disabled = true;
-  try { snapshot = await request('/api/tracking', { threadId: id || null }); render(); text('tracking-status', '已儲存追蹤設定。'); }
-  catch { text('tracking-status', '無法儲存，請確認本機服務已啟動後重試。'); }
-  finally { button.disabled = false; }
 });
 document.addEventListener('keydown', event => { if (event.altKey && event.key.toLowerCase() === 'r' && !dialog.open) { event.preventDefault(); void refresh(); } });
 document.addEventListener('visibilitychange', () => { void presence(); if (!document.hidden) { lastTick = Date.now(); void refresh(); } render(); });

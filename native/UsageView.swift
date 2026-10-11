@@ -25,7 +25,6 @@ struct UsageView: View {
     enum Page { case overview, details, settings }
     @ObservedObject var model: UsageModel
     @State private var page = Page.overview
-    @State private var tracking = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -70,7 +69,7 @@ struct UsageView: View {
                 PanelIconButton(symbol: "arrow.clockwise", label: "重新整理用量", action: model.refresh)
                     .disabled(model.manualRefreshing || model.snapshot?.updating == true)
                 if page != .settings {
-                    PanelIconButton(symbol: "slider.horizontal.3", label: "設定追蹤與單價", action: openSettings)
+                    PanelIconButton(symbol: "slider.horizontal.3", label: "設定單價與更新", action: openSettings)
                 }
                 PanelIconButton(symbol: "xmark", label: "收起面板") { model.closePanel?() }
             }
@@ -109,10 +108,10 @@ struct UsageView: View {
     var tokenSummary: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .top, spacing: 12) {
-                metric("聊天累計 Token", compactTokens(model.snapshot?.tokens.chat?.totalTokens))
+                metric("帳號累計 Token", compactTokens(model.snapshot?.tokens.lifetimeTokens ?? model.snapshot?.tokens.account?.totalTokens))
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 4) {
-                        Text("美元等值").font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
+                        Text("本機美元等值").font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
                         Spacer(minLength: 0)
                         Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold)).foregroundStyle(PanelStyle.muted)
                     }
@@ -138,12 +137,15 @@ struct UsageView: View {
     var tokenDetails: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
-                if let chat = model.snapshot?.tokens.chat {
-                    HStack(spacing: 12) {
-                        metric("聊天 Token 總計", chat.totalTokens.formatted(.number))
-                        metric("美元等值 · \(model.pricing == "fast" ? "Fast" : "Standard")", dollarText(model.usd))
-                    }.padding(.bottom, 2)
+                HStack(spacing: 12) {
+                    metric("帳號累計 Token", (model.snapshot?.tokens.lifetimeTokens ?? model.snapshot?.tokens.account?.totalTokens)?.formatted(.number) ?? "—")
+                    metric("本機美元等值", dollarText(model.usd))
+                }.padding(.bottom, 2)
+                if let chat = model.snapshot?.tokens.account {
+                    Text("目前帳號 · 本機 \(chat.sessionCount ?? 0) 個聊天")
+                        .font(.system(size: 10, weight: .medium)).foregroundStyle(PanelStyle.muted)
                     VStack(spacing: 6) {
+                        detail("本機 Token 總計", chat.totalTokens)
                         detail("一般輸入", chat.inputTokens - chat.cachedInputTokens - chat.cacheWriteInputTokens)
                         detail("快取輸入", chat.cachedInputTokens)
                         detail("快取寫入", chat.cacheWriteInputTokens)
@@ -154,21 +156,21 @@ struct UsageView: View {
                     .background(PanelStyle.surface, in: RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(PanelStyle.line, lineWidth: 0.5))
                     HStack {
-                        if let id = model.snapshot?.tokens.trackingId {
-                            Text("聊天 \(id.prefix(8))…").help(id)
-                        }
+                        Text("每 10 秒讀取本機新紀錄")
                         Spacer()
                         Text(localTime(chat.updatedAtMs))
                     }.font(.system(size: 9.5)).foregroundStyle(PanelStyle.muted)
                 } else {
                     Text(tokenNote).font(.system(size: 12, weight: .medium))
-                    Text("取得紀錄後會顯示輸入、快取、輸出與美元等值。")
+                    Text("目前帳號的本機紀錄會自動加總，顯示輸入、快取與輸出。")
                         .font(.system(size: 11)).foregroundStyle(PanelStyle.muted)
-                    Button("設定追蹤聊天", action: openSettings).buttonStyle(.borderless)
                 }
-                Text("API 單價估算，非訂閱帳單。推理已計入輸出；未含工具、儲存與地區附加費。")
+                Text("帳號總量優先使用官方累計；拆分與 API 等值只含本機紀錄，非訂閱帳單。推理已計入輸出。")
                     .font(.system(size: 10)).foregroundStyle(PanelStyle.muted).fixedSize(horizontal: false, vertical: true)
-                if let lifetime = model.snapshot?.tokens.lifetimeTokens { detail("帳號歷史 Token", lifetime) }
+                if model.snapshot?.tokens.accountErrorCode == "account_logs_incomplete" {
+                    Text("部分紀錄無法完整核對，美元等值暫不估算。")
+                        .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
+                }
                 detail("單價核對", model.payload?.priceDate ?? "—")
             }.padding(1)
         }.scrollIndicators(.hidden)
@@ -178,21 +180,11 @@ struct UsageView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("追蹤聊天").font(.system(size: 11, weight: .semibold))
-                    Text("固定追蹤一個聊天；切換 Codex 聊天不會自動更換。")
+                    Text("跟隨目前帳號").font(.system(size: 11, weight: .semibold))
+                    Text("自動加總目前帳號的本機聊天紀錄，切換聊天不需設定 ID。帳號切換或登出時會清除舊資料。")
                         .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
-                    TextField("聊天 ID；留空停止追蹤", text: $tracking)
-                        .font(.system(size: 10, design: .monospaced)).textFieldStyle(.plain)
-                        .padding(8).background(PanelStyle.surface, in: RoundedRectangle(cornerRadius: 7))
-                        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(PanelStyle.line, lineWidth: 0.5))
-                        .accessibilityLabel("追蹤聊天 ID")
-                    HStack(spacing: 8) {
-                        Button("儲存") { model.saveTracking(tracking) }.buttonStyle(.plain)
-                            .font(.system(size: 10, weight: .medium)).foregroundStyle(PanelStyle.accent)
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(PanelStyle.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                        Text(model.trackingMessage).font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
-                    }
+                    Text("官方累計可能較晚更新；其他裝置的聊天不會提供本機拆分。")
+                        .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
                 }
                 VStack(alignment: .leading, spacing: 7) {
                     Text("美元估算情境").font(.system(size: 11, weight: .semibold))
@@ -207,7 +199,7 @@ struct UsageView: View {
                 Text("選單列上行是短期、下行是每週剩餘。若被擠掉，可按住 ⌘ 拖到時鐘附近，位置會保留。")
                     .font(.system(size: 10)).foregroundStyle(PanelStyle.muted).fixedSize(horizontal: false, vertical: true)
                 HStack {
-                    Text("每 60 秒更新 · 台北時間").foregroundStyle(PanelStyle.muted)
+                    Text("帳號 60 秒 · 本機 Token 10 秒").foregroundStyle(PanelStyle.muted)
                     Spacer()
                     Button("退出") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(PanelStyle.muted)
                 }.font(.system(size: 10))
@@ -225,21 +217,20 @@ struct UsageView: View {
             .accessibilityValue(model.pricing == value ? "已選取" : "未選取")
     }
     func openSettings() {
-        tracking = model.snapshot?.tokens.trackingId ?? ""
-        model.trackingMessage = ""
         page = .settings
     }
     var tokenNote: String {
-        guard model.snapshot?.tokens.chat != nil else {
-            if model.snapshot == nil { return "正在讀取聊天 Token…" }
-            switch model.snapshot?.tokens.chatErrorCode {
-            case "no_tracked_thread": return "尚未追蹤聊天 · 點設定選擇"
-            case "log_identity_mismatch": return "紀錄與目前帳號不符"
-            case "log_unavailable": return "找不到追蹤聊天紀錄"
-            default: return "尚未取得聊天 Token 紀錄"
+        guard model.snapshot?.tokens.account != nil else {
+            if model.snapshot == nil { return "正在讀取帳號 Token…" }
+            switch model.snapshot?.tokens.accountErrorCode {
+            case "no_account_logs", "no_token_events": return "目前帳號尚無可核對的本機紀錄"
+            case "account_logs_incomplete": return "本機紀錄不完整 · 暫不估價"
+            case "log_unavailable": return "暫時無法讀取本機 Token 紀錄"
+            default: return "正在取得目前帳號的本機 Token"
             }
         }
-        return "\(model.pricing == "fast" ? "Fast × 2" : "Standard") API 等值 · 非訂閱帳單\(model.usd == nil ? " · 資料不足" : "")"
+        let source = model.snapshot?.tokens.lifetimeTokens != nil ? "官方累計" : "本機累計"
+        return "\(source) · 本機 \(model.pricing == "fast" ? "Fast × 2" : "Standard") 等值\(model.usd == nil ? " · 資料不足" : "")"
     }
     func detail(_ name: String, _ value: Int64) -> some View { detail(name, value.formatted(.number)) }
     func detail(_ name: String, _ value: String) -> some View {

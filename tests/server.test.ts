@@ -8,7 +8,9 @@ test('loopback API enforces Host/Origin, exposes no account identifiers, support
   const app = createUsageServer({ service: new UsageService({ demo: true }), port: 0 });
   const origin = await app.listen();
   try {
-    assert.equal((await fetch(`${origin}/health`)).status, 200);
+    const health = await (await fetch(`${origin}/health`)).json();
+    assert.equal(health.apiVersion, 2);
+    assert.equal(health.version, '0.3.3');
     assert.equal((await fetch(`${origin}/api/usage`, { headers: { Origin: 'https://example.com' } })).status, 403);
     const wrongHostStatus = await new Promise(resolve => {
       const req = httpRequest(`${origin}/api/usage`, { headers: { Host: 'evil.example' } }, res => { res.resume(); resolve(res.statusCode); });
@@ -64,6 +66,10 @@ test('native API and stream share token pricing and keep the menu-bar panel in t
     await app.service.refresh();
     const payload = await (await fetch(`${origin}/api/native`)).json();
     assert.equal(payload.snapshot.tokens.chat.totalTokens, 920000);
+    assert.equal(payload.snapshot.tokens.account.totalTokens, 920000);
+    assert.equal(payload.snapshot.tokens.account.sessionCount, 3);
+    assert.equal(payload.snapshot.tokens.lifetimeTokens, 12640000);
+    assert.ok(payload.standardUsd > 0);
     assert.equal(payload.fastUsd, payload.standardUsd * 2);
     assert.equal(payload.priceDate, '2026-10-08');
     const stream = await fetch(`${origin}/api/native/events?id=native&visible=true&interval=60`, { signal: controller.signal });

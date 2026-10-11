@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { AdapterError, CodexAdapter } from './adapter.ts';
 import { backoffMs, emptySnapshot, normalizeUsage, type Snapshot } from './domain.ts';
-import { LocalTokenReader } from './local-tokens.ts';
+import { AccountTokenReader, LocalTokenReader } from './local-tokens.ts';
 import { emptyTokens, normalizeAccountTokens, type ChatTokens } from './tokens.ts';
 
 function authKey(response: any): string | null {
@@ -37,12 +37,16 @@ export class UsageService extends EventEmitter {
   sourceAccountId: string | null = null;
   tokenGeneration = 0;
   localReader: Pick<LocalTokenReader, 'read'>;
+  accountReader: Pick<AccountTokenReader, 'read'>;
   localInFlight: Promise<void> | null = null;
+  localReadGeneration: number | null = null;
 
   constructor({ adapter = new CodexAdapter(), demo = false, now = Date.now, random = Math.random,
-    trackingId = null as string | null, localReader = new LocalTokenReader() as Pick<LocalTokenReader, 'read'> } = {}) {
+    trackingId = null as string | null, localReader = new LocalTokenReader() as Pick<LocalTokenReader, 'read'>,
+    accountReader = new AccountTokenReader() as Pick<AccountTokenReader, 'read'> } = {}) {
     super(); this.adapter = adapter; this.demo = demo; this.now = now; this.random = random;
-    this.trackingId = trackingId; this.localReader = localReader; this.snapshot.tokens = emptyTokens(trackingId);
+    this.trackingId = trackingId; this.localReader = localReader; this.accountReader = accountReader;
+    this.snapshot.tokens = emptyTokens(trackingId);
     adapter.on('account/updated', () => {
       this.invalidate();
       if (!this.inFlight && !this.closed) void this.refresh();
@@ -63,7 +67,8 @@ export class UsageService extends EventEmitter {
 
   publish(): void { this.emit('snapshot', this.getSnapshot()); }
   getSnapshot(): Snapshot {
-    const s = { ...this.snapshot };
+    // Readers and consumers must not share mutable counters or segment arrays.
+    const s = structuredClone(this.snapshot);
     if (s.status === 'ready' && s.fetchedAtMs !== null && this.now() - s.fetchedAtMs > 120_000) s.status = 'stale';
     return s;
   }
@@ -84,18 +89,27 @@ export class UsageService extends EventEmitter {
     await this.refreshLocalTokens();
   }
   refreshLocalTokens(): Promise<void> {
-    if (this.localInFlight) return this.localInFlight;
     if (this.closed || this.demo || !this.sourceAccountId) return Promise.resolve();
+    if (this.localInFlight) {
+      if (this.localReadGeneration === this.tokenGeneration) return this.localInFlight;
+      // Serialize readers, but let callers await the new identity's result too.
+      return this.localInFlight.then(() => this.refreshLocalTokens());
+    }
     const accountId = this.sourceAccountId, id = this.trackingId, generation = this.tokenGeneration;
+    this.localReadGeneration = generation;
     this.localInFlight = (async () => {
-      let result;
-      try { result = await this.localReader.read(id, accountId); }
-      catch { result = { chat: null, errorCode: 'log_unavailable' }; }
+      const [chatResult, accountResult] = await Promise.all([
+        id === null ? Promise.resolve({ chat: null, errorCode: 'no_tracked_thread' })
+          : Promise.resolve().then(() => this.localReader.read(id, accountId)).catch(() => ({ chat: null, errorCode: 'log_unavailable' })),
+        Promise.resolve().then(() => this.accountReader.read(accountId)).catch(() => ({ account: null, errorCode: 'log_unavailable' })),
+      ]);
       if (this.closed || generation !== this.tokenGeneration || accountId !== this.sourceAccountId || id !== this.trackingId) return;
-      this.snapshot.tokens = { ...this.snapshot.tokens, trackingId: id, chat: result.chat, chatErrorCode: result.errorCode };
+      this.snapshot.tokens = { ...this.snapshot.tokens, trackingId: id,
+        chat: structuredClone(chatResult.chat), chatErrorCode: chatResult.errorCode,
+        account: structuredClone(accountResult.account), accountErrorCode: accountResult.errorCode };
       this.publish();
     })().finally(() => {
-      this.localInFlight = null;
+      this.localInFlight = null; this.localReadGeneration = null;
       if (!this.closed && generation !== this.tokenGeneration && this.sourceAccountId) void this.refreshLocalTokens();
     });
     return this.localInFlight;
@@ -151,7 +165,8 @@ export class UsageService extends EventEmitter {
         const chat: ChatTokens = { inputTokens: 900000, cachedInputTokens: 800000, cacheWriteInputTokens: 0, outputTokens: 20000, reasoningOutputTokens: 6000, totalTokens: 920000, segments: [], updatedAtMs: now, complete: true };
         const { segments: _segments, updatedAtMs: _time, complete: _complete, ...counters } = chat;
         chat.segments = [{ ...counters, model: 'gpt-6.1-sol', longContext: false }];
-        this.snapshot.tokens = { ...emptyTokens(this.trackingId), chat, ...normalizeAccountTokens({ summary: { lifetimeTokens: 12640000 }, dailyUsageBuckets: [{ startDate: '2026-10-07', tokens: 740000 }] }, now) };
+        this.snapshot.tokens = { ...emptyTokens(this.trackingId), chat, account: { ...structuredClone(chat), sessionCount: 3 },
+          ...normalizeAccountTokens({ summary: { lifetimeTokens: 12640000 }, dailyUsageBuckets: [{ startDate: '2026-10-07', tokens: 740000 }] }, now) };
         this.failures = 0; this.publish(); return this.getSnapshot();
       }
       await this.adapter.start();
@@ -188,6 +203,7 @@ export class UsageService extends EventEmitter {
         this.snapshot = normalizeUsage(raw, after.account.planType, this.now());
         this.snapshot.tokens = { ...previousTokens, ...(accountTokens ?? { errorCode: tokenError }), trackingId: this.trackingId };
         await this.refreshLocalTokens();
+        if (generation !== this.generation) return this.getSnapshot();
       }
       this.failures = 0;
     } catch (error: any) {

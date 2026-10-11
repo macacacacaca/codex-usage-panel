@@ -23,12 +23,15 @@ struct ChatTokens: Decodable {
     let totalTokens: Int64
     let updatedAtMs: Double?
     let complete: Bool
+    let sessionCount: Int?
 }
 struct TokenProfile: Decodable {
     let trackingId: String?
     let chat: ChatTokens?
     let chatErrorCode: String?
     let lifetimeTokens: Int64?
+    let account: ChatTokens?
+    let accountErrorCode: String?
 }
 struct UsageSnapshot: Decodable {
     let status: String
