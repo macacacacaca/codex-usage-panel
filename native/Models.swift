@@ -6,6 +6,7 @@ struct UsageWindow: Decodable {
     let provided: Bool
     let usedPercent: Double?
     let remainingPercent: Double?
+    let durationMins: Double?
     let resetsAtMs: Double?
 }
 struct UsageBucket: Decodable {
@@ -14,7 +15,12 @@ struct UsageBucket: Decodable {
     let serverLimitState: String?
     let windows: [UsageWindow]
 }
-struct ChatTokens: Decodable {
+struct TokenWindow: Decodable {
+    let startAtMs: Double
+    let endAtMs: Double
+    let windowMinutes: Int
+}
+struct WindowTokens: Decodable {
     let inputTokens: Int64
     let cachedInputTokens: Int64
     let cacheWriteInputTokens: Int64
@@ -23,15 +29,12 @@ struct ChatTokens: Decodable {
     let totalTokens: Int64
     let updatedAtMs: Double?
     let complete: Bool
-    let sessionCount: Int?
+    let sessionCount: Int
+    let window: TokenWindow
 }
 struct TokenProfile: Decodable {
-    let trackingId: String?
-    let chat: ChatTokens?
-    let chatErrorCode: String?
-    let lifetimeTokens: Int64?
-    let account: ChatTokens?
-    let accountErrorCode: String?
+    let period: WindowTokens?
+    let periodErrorCode: String?
 }
 struct UsageSnapshot: Decodable {
     let status: String
@@ -47,6 +50,18 @@ struct NativePayload: Decodable {
     let standardUsd: Double?
     let fastUsd: Double?
     let priceDate: String
+}
+
+func currentPeriod(_ snapshot: UsageSnapshot?, now: Date = Date()) -> WindowTokens? {
+    guard let snapshot, let period = snapshot.tokens.period,
+          let quota = snapshot.buckets.first(where: { $0.id == "codex" })?.windows.first(where: { $0.provided && $0.durationMins == 300 }),
+          let reset = quota.resetsAtMs else { return nil }
+    let window = period.window, milliseconds = now.timeIntervalSince1970 * 1000
+    guard window.windowMinutes == 300, window.startAtMs.isFinite, window.endAtMs.isFinite,
+          milliseconds.isFinite, window.startAtMs >= 0,
+          window.endAtMs == reset, window.startAtMs == reset - 18_000_000,
+          window.startAtMs <= milliseconds, milliseconds < window.endAtMs else { return nil }
+    return period
 }
 
 func percentage(_ value: Double?) -> String {

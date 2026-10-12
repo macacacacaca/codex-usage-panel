@@ -9,8 +9,8 @@ test('loopback API enforces Host/Origin, exposes no account identifiers, support
   const origin = await app.listen();
   try {
     const health = await (await fetch(`${origin}/health`)).json();
-    assert.equal(health.apiVersion, 2);
-    assert.equal(health.version, '0.3.3');
+    assert.equal(health.apiVersion, 3);
+    assert.equal(health.version, '0.3.4');
     assert.equal((await fetch(`${origin}/api/usage`, { headers: { Origin: 'https://example.com' } })).status, 403);
     const wrongHostStatus = await new Promise(resolve => {
       const req = httpRequest(`${origin}/api/usage`, { headers: { Host: 'evil.example' } }, res => { res.resume(); resolve(res.statusCode); });
@@ -68,10 +68,13 @@ test('native API and stream share token pricing and keep the menu-bar panel in t
     assert.equal(payload.snapshot.tokens.chat.totalTokens, 920000);
     assert.equal(payload.snapshot.tokens.account.totalTokens, 920000);
     assert.equal(payload.snapshot.tokens.account.sessionCount, 3);
+    assert.equal(payload.snapshot.tokens.period.totalTokens, 920000);
+    assert.equal(payload.snapshot.tokens.period.window.windowMinutes, 300);
+    assert.equal(payload.snapshot.tokens.period.window.endAtMs - payload.snapshot.tokens.period.window.startAtMs, 18_000_000);
     assert.equal(payload.snapshot.tokens.lifetimeTokens, 12640000);
     assert.ok(payload.standardUsd > 0);
     assert.equal(payload.fastUsd, payload.standardUsd * 2);
-    assert.equal(payload.priceDate, '2026-10-08');
+    assert.equal(payload.priceDate, '2026-10-12');
     const stream = await fetch(`${origin}/api/native/events?id=native&visible=true&interval=60`, { signal: controller.signal });
     const first = await stream.body!.getReader().read();
     const text = new TextDecoder().decode(first.value);

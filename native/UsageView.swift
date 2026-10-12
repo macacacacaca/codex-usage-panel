@@ -56,7 +56,7 @@ struct UsageView: View {
             } else {
                 PanelIconButton(symbol: "chevron.left", label: "返回用量") { page = .overview }
             }
-            Text(page == .overview ? "Codex" : page == .details ? "Token 明細" : "設定")
+            Text(page == .overview ? "Codex" : page == .details ? "本次 5 小時明細" : "設定")
                 .font(.system(size: 13, weight: .semibold))
             if page == .overview, let plan = model.snapshot?.planLabel {
                 Text(plan).font(.system(size: 9, weight: .medium)).foregroundStyle(PanelStyle.muted)
@@ -91,8 +91,8 @@ struct UsageView: View {
                     }
                     Button { page = .details } label: { tokenSummary }
                         .buttonStyle(TokenCardStyle())
-                        .help("查看輸入、快取、輸出與價格明細")
-                        .accessibilityLabel("查看 Token 明細，聊天累計 \(compactTokens(model.snapshot?.tokens.chat?.totalTokens)) Token，美元等值 \(dollarText(model.usd))")
+                        .help("查看本次 5 小時的輸入、快取、輸出與價格明細")
+                        .accessibilityLabel("查看本次 5 小時明細，\(compactTokens(model.period?.totalTokens)) Token，美元等值 \(dollarText(model.usd))")
                 }.padding(1)
             }.scrollIndicators(.hidden)
             HStack(spacing: 5) {
@@ -108,10 +108,10 @@ struct UsageView: View {
     var tokenSummary: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .top, spacing: 12) {
-                metric("帳號累計 Token", compactTokens(model.snapshot?.tokens.lifetimeTokens ?? model.snapshot?.tokens.account?.totalTokens))
+                metric("本次 5 小時 Token", compactTokens(model.period?.totalTokens))
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 4) {
-                        Text("本機美元等值").font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
+                        Text("本次美元等值").font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
                         Spacer(minLength: 0)
                         Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold)).foregroundStyle(PanelStyle.muted)
                     }
@@ -138,14 +138,16 @@ struct UsageView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 12) {
-                    metric("帳號累計 Token", (model.snapshot?.tokens.lifetimeTokens ?? model.snapshot?.tokens.account?.totalTokens)?.formatted(.number) ?? "—")
-                    metric("本機美元等值", dollarText(model.usd))
+                    metric(model.period?.complete == false ? "可核對 Token 小計" : "本次 5 小時 Token", model.period?.totalTokens.formatted(.number) ?? "—")
+                    metric("本次美元等值", dollarText(model.usd))
                 }.padding(.bottom, 2)
-                if let chat = model.snapshot?.tokens.account {
-                    Text("目前帳號 · 本機 \(chat.sessionCount ?? 0) 個聊天")
+                if let chat = model.period {
+                    detail("區間開始（台北）", localTime(chat.window.startAtMs))
+                    detail("區間結束（台北）", localTime(chat.window.endAtMs))
+                    Text("目前帳號 · 本區間 \(chat.sessionCount) 個本機聊天")
                         .font(.system(size: 10, weight: .medium)).foregroundStyle(PanelStyle.muted)
                     VStack(spacing: 6) {
-                        detail("本機 Token 總計", chat.totalTokens)
+                        detail(chat.complete ? "本次 Token 總計" : "可核對 Token 小計", chat.totalTokens)
                         detail("一般輸入", chat.inputTokens - chat.cachedInputTokens - chat.cacheWriteInputTokens)
                         detail("快取輸入", chat.cachedInputTokens)
                         detail("快取寫入", chat.cacheWriteInputTokens)
@@ -162,13 +164,13 @@ struct UsageView: View {
                     }.font(.system(size: 9.5)).foregroundStyle(PanelStyle.muted)
                 } else {
                     Text(tokenNote).font(.system(size: 12, weight: .medium))
-                    Text("目前帳號的本機紀錄會自動加總，顯示輸入、快取與輸出。")
+                    Text("取得有效的 5 小時額度區間後，會自動加總目前帳號在區間內的本機紀錄。")
                         .font(.system(size: 11)).foregroundStyle(PanelStyle.muted)
                 }
-                Text("帳號總量優先使用官方累計；拆分與 API 等值只含本機紀錄，非訂閱帳單。推理已計入輸出。")
+                Text("Token 與美元均只計本次 5 小時區間內的本機紀錄，不含其他裝置；API 等值非訂閱帳單。推理已計入輸出。")
                     .font(.system(size: 10)).foregroundStyle(PanelStyle.muted).fixedSize(horizontal: false, vertical: true)
-                if model.snapshot?.tokens.accountErrorCode == "account_logs_incomplete" {
-                    Text("部分紀錄無法完整核對，美元等值暫不估算。")
+                if model.period?.complete == false || model.snapshot?.tokens.periodErrorCode == "period_logs_incomplete" {
+                    Text("資料不完整，僅顯示可核對的 Token 小計，美元等值暫不估算。")
                         .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
                 }
                 detail("單價核對", model.payload?.priceDate ?? "—")
@@ -181,9 +183,9 @@ struct UsageView: View {
             VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("跟隨目前帳號").font(.system(size: 11, weight: .semibold))
-                    Text("自動加總目前帳號的本機聊天紀錄，切換聊天不需設定 ID。帳號切換或登出時會清除舊資料。")
+                    Text("依官方重置時間加總本次 5 小時內的本機紀錄，切換聊天不需設定 ID。帳號切換或登出時會清除舊資料。")
                         .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
-                    Text("官方累計可能較晚更新；其他裝置的聊天不會提供本機拆分。")
+                    Text("本次 Token 與美元使用相同區間；其他裝置的紀錄不在統計內。區間重置後會重新確認。")
                         .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
                 }
                 VStack(alignment: .leading, spacing: 7) {
@@ -220,17 +222,24 @@ struct UsageView: View {
         page = .settings
     }
     var tokenNote: String {
-        guard model.snapshot?.tokens.account != nil else {
-            if model.snapshot == nil { return "正在讀取帳號 Token…" }
-            switch model.snapshot?.tokens.accountErrorCode {
-            case "no_account_logs", "no_token_events": return "目前帳號尚無可核對的本機紀錄"
-            case "account_logs_incomplete": return "本機紀錄不完整 · 暫不估價"
+        guard model.period != nil else {
+            if model.snapshot == nil { return "正在讀取本次 5 小時 Token…" }
+            if let period = model.snapshot?.tokens.period {
+                return period.window.endAtMs <= model.now.timeIntervalSince1970 * 1000
+                    ? "正在確認新的 5 小時區間…" : "尚無有效的 5 小時額度區間"
+            }
+            switch model.snapshot?.tokens.periodErrorCode {
+            case "window_unavailable": return "尚無有效的 5 小時額度區間"
+            case "window_expired": return "正在確認新的 5 小時區間…"
+            case "no_token_events": return "目前帳號尚無可核對的本機紀錄"
+            case "period_logs_incomplete": return "本次紀錄不完整 · 暫不估價"
             case "log_unavailable": return "暫時無法讀取本機 Token 紀錄"
-            default: return "正在取得目前帳號的本機 Token"
+            case "counter_overflow", "log_identity_mismatch": return "無法核對本次 Token 紀錄"
+            default: return "正在取得本次 5 小時 Token"
             }
         }
-        let source = model.snapshot?.tokens.lifetimeTokens != nil ? "官方累計" : "本機累計"
-        return "\(source) · 本機 \(model.pricing == "fast" ? "Fast × 2" : "Standard") 等值\(model.usd == nil ? " · 資料不足" : "")"
+        if model.period?.complete == false { return "本次可核對 Token 小計 · 資料不完整 · 暫不估價" }
+        return "本次本機 \(model.pricing == "fast" ? "Fast × 2" : "Standard") 等值 · 非帳單\(model.usd == nil ? " · 資料不足" : "")"
     }
     func detail(_ name: String, _ value: Int64) -> some View { detail(name, value.formatted(.number)) }
     func detail(_ name: String, _ value: String) -> some View {

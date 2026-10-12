@@ -3,13 +3,48 @@ import { readdir, lstat, open, type FileHandle } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
-import { counter, normalizeCounters, type AccountTokens, type ChatTokens, type Counters, type TokenSegment } from './tokens.ts';
+import { counter, normalizeCounters, type AccountTokens, type ChatTokens, type Counters, type TokenSegment, type TokenWindow, type WindowTokens } from './tokens.ts';
 
 export function validThreadId(id: unknown): id is string {
   return typeof id === 'string' && /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(id);
 }
 const ZERO: Counters = { inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
 const FIELDS = Object.keys(ZERO) as Array<keyof Counters>;
+type PeriodEntry = { atMs: number; segment: TokenSegment; sourceTotal: Counters; complete: boolean };
+type PeriodUncertainty = { fromMs: number | null; toMs: number | null };
+type AccountReadResult = { account: AccountTokens | null; errorCode: string | null; period: WindowTokens | null; periodErrorCode: string | null };
+const MAX_PERIOD_ENTRIES = 20_000;
+const MAX_PERIOD_UNCERTAINTIES = 256;
+
+function aggregate(snapshots: ChatTokens[], incomplete = false): AccountTokens | null {
+  const result: AccountTokens = { ...ZERO, segments: [], updatedAtMs: null, complete: !incomplete, sessionCount: snapshots.length };
+  const segments = new Map<string, TokenSegment>();
+  for (const snapshot of snapshots) {
+    for (const field of FIELDS) {
+      const value = counter(result[field] + snapshot[field]); if (value === null) return null;
+      result[field] = value;
+    }
+    result.complete &&= snapshot.complete;
+    if (snapshot.updatedAtMs !== null) result.updatedAtMs = Math.max(result.updatedAtMs ?? snapshot.updatedAtMs, snapshot.updatedAtMs);
+    for (const segment of snapshot.segments) {
+      const key = `${segment.model ?? 'unknown'}:${segment.longContext}`;
+      const merged = segments.get(key) ?? { ...ZERO, model: segment.model, longContext: segment.longContext };
+      for (const field of FIELDS) {
+        const value = counter(merged[field] + segment[field]); if (value === null) return null;
+        merged[field] = value;
+      }
+      segments.set(key, merged);
+    }
+  }
+  result.segments = [...segments.values()]; return result;
+}
+
+function windowError(window: TokenWindow | null | undefined, now: number): string | null {
+  if (!window || !Number.isSafeInteger(window.startAtMs) || !Number.isSafeInteger(window.endAtMs) ||
+      window.startAtMs < 0 || window.endAtMs <= window.startAtMs || !Number.isSafeInteger(window.windowMinutes) || window.windowMinutes <= 0 ||
+      window.endAtMs - window.startAtMs !== window.windowMinutes * 60_000 || !Number.isSafeInteger(now) || now < window.startAtMs) return 'window_unavailable';
+  return now >= window.endAtMs ? 'window_expired' : null;
+}
 async function fileMarker(handle: FileHandle, offset: number): Promise<string | null> {
   if (!offset) return null;
   // Bounded fingerprints detect replacement/truncation followed by regrowth,
@@ -36,13 +71,64 @@ export class TokenLogState {
   private forked = false;
   private rawTotal: Counters | null = null;
   private inheritedTotal: Counters = { ...ZERO };
+  private rawAtMs: number | null = null;
+  periodRetainFromMs: number;
+  private periodEntries: PeriodEntry[] = [];
+  private periodUncertainties: PeriodUncertainty[] = [];
+  private pendingUncertainties: PeriodUncertainty[] = [];
 
-  skipRecord(): void { this.ordinal++; this.complete = false; }
+  constructor(retainFromMs = Infinity) { this.periodRetainFromMs = retainFromMs; }
+  retainPeriodFrom(startAtMs: number): void {
+    this.periodRetainFromMs = startAtMs;
+    this.periodEntries = this.periodEntries.filter(entry => entry.atMs >= startAtMs);
+    this.periodUncertainties = this.periodUncertainties.filter(gap => gap.toMs === null || gap.toMs >= startAtMs);
+    this.pendingUncertainties = this.pendingUncertainties.filter(gap => this.periodUncertainties.includes(gap));
+  }
+  private uncertain(fromMs: number | null, toMs: number | null): void {
+    if (fromMs !== null && toMs !== null && fromMs > toMs) { fromMs = null; toMs = null; }
+    if (this.periodRetainFromMs === Infinity || (toMs !== null && toMs < this.periodRetainFromMs)) return;
+    const gap = { fromMs, toMs }; this.periodUncertainties.push(gap);
+    if (toMs === null) this.pendingUncertainties.push(gap);
+    if (this.periodUncertainties.length > MAX_PERIOD_UNCERTAINTIES) {
+      // Exhausted evidence is explicitly incomplete instead of silently dropped.
+      const bounded = {
+        fromMs: this.periodUncertainties.some(item => item.fromMs === null) ? null : Math.min(...this.periodUncertainties.map(item => item.fromMs!)),
+        toMs: this.periodUncertainties.some(item => item.toMs === null) ? null : Math.max(...this.periodUncertainties.map(item => item.toMs!)),
+      };
+      this.periodUncertainties = [bounded]; this.pendingUncertainties = bounded.toMs === null ? [bounded] : [];
+    }
+  }
+  private observeTime(atMs: number | null): void {
+    if (atMs === null || !this.pendingUncertainties.length) return;
+    for (const gap of this.pendingUncertainties) {
+      if (gap.fromMs === null || gap.fromMs <= atMs) gap.toMs = atMs;
+    }
+    this.pendingUncertainties = this.pendingUncertainties.filter(gap => gap.toMs === null);
+    this.retainPeriodFrom(this.periodRetainFromMs);
+  }
+  periodSnapshot(window: TokenWindow, now: number): ChatTokens | null {
+    const entries = this.periodEntries.filter(entry => entry.atMs >= window.startAtMs && entry.atMs < window.endAtMs && entry.atMs <= now);
+    const incomplete = this.periodUncertainties.some(gap =>
+      (gap.toMs === null || gap.toMs >= window.startAtMs) && (gap.fromMs === null || (gap.fromMs < window.endAtMs && gap.fromMs <= now)));
+    return aggregate(entries.map(entry => ({ ...entry.segment, segments: [{ ...entry.segment }], complete: entry.complete, updatedAtMs: entry.atMs })), incomplete);
+  }
+  periodEvidence(window: TokenWindow, now: number): Map<string, number> {
+    const evidence = new Map<string, number>();
+    for (const entry of this.periodEntries) {
+      if (entry.atMs < window.startAtMs || entry.atMs >= window.endAtMs || entry.atMs > now) continue;
+      const key = createHash('sha256').update(JSON.stringify([entry.atMs, entry.segment.model, entry.segment.longContext,
+        ...FIELDS.map(field => entry.segment[field]), ...FIELDS.map(field => entry.sourceTotal[field])])).digest('hex');
+      evidence.set(key, (evidence.get(key) ?? 0) + 1);
+    }
+    return evidence;
+  }
+
+  skipRecord(): void { this.ordinal++; this.complete = false; this.uncertain(this.rawAtMs, null); }
 
   accept(line: string): void {
     const ordinal = this.ordinal++;
     if (!/"type"\s*:\s*"(token_count|turn_context|session_meta)"/.test(line)) return;
-    let row: any; try { row = JSON.parse(line); } catch { this.complete = false; return; }
+    let row: any; try { row = JSON.parse(line); } catch { this.complete = false; this.uncertain(this.rawAtMs, null); return; }
     if (row.type === 'session_meta') {
       // The first metadata belongs to this rollout. Copied fork history can
       // contain ancestors' metadata; it must never replace canonical ownership.
@@ -58,12 +144,16 @@ export class TokenLogState {
       this.model = typeof row.payload?.model === 'string' ? row.payload.model.slice(0, 100) : null;
     } else if (row.type === 'event_msg' && row.payload?.type === 'token_count' && row.payload.info) {
       const info = row.payload.info;
+      const parsedTime = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
+      const atMs = Number.isFinite(parsedTime) ? parsedTime : null;
       const next = normalizeCounters(info.total_token_usage);
-      if (!next) { this.complete = false; return; }
-      if (this.forkAmbiguous) return;
       if (this.forked && ordinal < this.ownStartOrdinal!) {
-        this.rawTotal = next; this.inheritedTotal = next; return;
+        if (next) { this.rawTotal = next; this.inheritedTotal = next; this.rawAtMs = atMs; }
+        return;
       }
+      this.observeTime(atMs);
+      if (!next) { this.complete = false; this.uncertain(atMs ?? this.rawAtMs, atMs); return; }
+      if (this.forkAmbiguous) { this.uncertain(atMs ?? this.rawAtMs, atMs); return; }
       let previous = this.rawTotal ?? ZERO;
       const last = normalizeCounters(info.last_token_usage);
       // Equal nonzero counters at the child boundary could be either a replay
@@ -71,7 +161,7 @@ export class TokenLogState {
       // No local signal can distinguish them, so exclude this ambiguous fork.
       if (this.forked && this.total === null && previous.totalTokens > 0 && last &&
           FIELDS.every(field => next[field] === last[field] && next[field] === previous[field])) {
-        this.forkAmbiguous = true; this.complete = false; return;
+        this.forkAmbiguous = true; this.complete = false; this.uncertain(atMs ?? this.rawAtMs, atMs); return;
       }
       // A first own request can restart cumulative counters above or below the
       // inherited total. Equality with the last request proves a fresh counter;
@@ -86,6 +176,7 @@ export class TokenLogState {
           previous = ZERO; this.inheritedTotal = { ...ZERO };
         } else {
           this.complete = false; this.rawTotal = next;
+          this.uncertain(this.rawAtMs, atMs); this.rawAtMs = atMs;
           if (this.forked) { this.forkAmbiguous = true; this.total = null; }
           else this.total = next;
           return;
@@ -93,17 +184,21 @@ export class TokenLogState {
       }
       const delta = Object.fromEntries(FIELDS.map(field => [field, next[field] - previous[field]])) as Counters;
       if (this.forked && this.total === null && delta.totalTokens !== 0 && (!last || FIELDS.some(field => delta[field] !== last[field]))) {
-        this.forkAmbiguous = true; this.complete = false; return;
+        this.forkAmbiguous = true; this.complete = false; this.uncertain(atMs ?? this.rawAtMs, atMs); return;
       }
       const ownTotal = Object.fromEntries(FIELDS.map(field => [field, next[field] - this.inheritedTotal[field]])) as Counters;
       if (delta.totalTokens === 0) {
-        if (FIELDS.some(field => delta[field] !== 0)) { this.complete = false; this.total = ownTotal; this.rawTotal = next; }
+        if (FIELDS.some(field => delta[field] !== 0)) { this.complete = false; this.total = ownTotal; this.rawTotal = next; this.uncertain(atMs ?? this.rawAtMs, atMs); this.rawAtMs = atMs; }
         return;
       }
       const requestInput = counter(info.last_token_usage?.input_tokens);
       const longContext = requestInput === null ? null : requestInput > 272_000;
       // A missing event could span multiple models or request lengths. Never
       // assign its cumulative gap to the last model and present a partial price.
+      const exact = !!last && FIELDS.every(field => delta[field] === last[field]);
+      const priced = !!this.model && exact &&
+          counter(info.total_token_usage.cache_write_input_tokens) !== null &&
+          counter(info.last_token_usage?.cache_write_input_tokens) !== null && longContext !== null;
       if (!this.model || !last || FIELDS.some(field => delta[field] !== last[field]) ||
           counter(info.total_token_usage.cache_write_input_tokens) === null ||
           counter(info.last_token_usage?.cache_write_input_tokens) === null || longContext === null) this.complete = false;
@@ -111,8 +206,17 @@ export class TokenLogState {
       const segment = this.segments.get(key) ?? { ...ZERO, model: this.model, longContext };
       for (const field of FIELDS) segment[field] += delta[field];
       this.segments.set(key, segment); this.total = ownTotal; this.rawTotal = next;
-      const timestamp = Date.parse(row.timestamp);
-      this.updatedAtMs = Number.isFinite(timestamp) ? timestamp : this.updatedAtMs;
+      if (!exact) this.uncertain(this.rawAtMs, atMs);
+      else if (atMs === null) this.uncertain(this.rawAtMs, null);
+      else if (atMs >= this.periodRetainFromMs) {
+        this.periodEntries.push({ atMs, segment: { ...delta, model: this.model, longContext }, sourceTotal: { ...next }, complete: priced });
+        if (this.periodEntries.length > MAX_PERIOD_ENTRIES) {
+          const removed = this.periodEntries.splice(0, 1_000);
+          this.uncertain(Math.min(...removed.map(entry => entry.atMs)), Math.max(...removed.map(entry => entry.atMs)));
+        }
+      }
+      this.rawAtMs = atMs;
+      this.updatedAtMs = atMs ?? this.updatedAtMs;
     }
   }
   snapshot(): ChatTokens | null {
@@ -128,10 +232,17 @@ export class LocalTokenReader {
   inode: number | null = null;
   private device: number | null = null;
   private marker: string | null = null;
+  private retainFromMs = Infinity;
   state = new TokenLogState();
   constructor(root = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'sessions')) { this.root = root; }
   reset(id: string | null): void {
-    this.id = id; this.path = null; this.offset = 0; this.inode = null; this.device = null; this.marker = null; this.state = new TokenLogState();
+    this.id = id; this.path = null; this.offset = 0; this.inode = null; this.device = null; this.marker = null; this.state = new TokenLogState(this.retainFromMs);
+  }
+  preparePeriod(startAtMs: number): void {
+    if (startAtMs < this.retainFromMs) {
+      this.offset = 0; this.marker = null; this.state = new TokenLogState(startAtMs);
+    } else this.state.retainPeriodFrom(startAtMs);
+    this.retainFromMs = startAtMs;
   }
   async find(path: string, id: string, depth = 0): Promise<string | null> {
     let entries; try {
@@ -174,7 +285,7 @@ export class LocalTokenReader {
       if (!info.isFile() || file.ino !== info.ino || file.dev !== info.dev) throw new Error('Session file changed');
       if (this.inode !== info.ino || this.device !== info.dev || info.size < this.offset ||
           (this.marker !== null && await fileMarker(handle, this.offset) !== this.marker)) {
-        this.offset = 0; this.state = new TokenLogState(); this.inode = info.ino; this.device = info.dev; this.marker = null;
+        this.offset = 0; this.state = new TokenLogState(this.retainFromMs); this.inode = info.ino; this.device = info.dev; this.marker = null;
       }
       if (info.size > this.offset) {
         // Incremental JSONL parsing. Incomplete final records are reread next time.
@@ -215,8 +326,9 @@ export class AccountTokenReader {
   private readers = new Map<string, LocalTokenReader>();
   private pending: Promise<unknown> = Promise.resolve();
   constructor(root = process.env.CODEX_HOME ?? join(homedir(), '.codex')) { this.root = root; }
-  read(accountId: string): Promise<{ account: AccountTokens | null; errorCode: string | null }> {
-    const result = this.pending.catch(() => {}).then(() => this.readAccount(accountId));
+  read(accountId: string, window?: TokenWindow | null, now = Date.now()): Promise<AccountReadResult> {
+    const requestedWindow = window ? { ...window } : window;
+    const result = this.pending.catch(() => {}).then(() => this.readAccount(accountId, requestedWindow, now));
     this.pending = result;
     return result;
   }
@@ -234,55 +346,67 @@ export class AccountTokenReader {
       return incomplete;
     } catch (error: any) { return error?.code !== 'ENOENT' || wasPresent || depth > 0; }
   }
-  private async readAccount(accountId: string): Promise<{ account: AccountTokens | null; errorCode: string | null }> {
+  private async readAccount(accountId: string, window: TokenWindow | null | undefined, now: number): Promise<AccountReadResult> {
+    const periodErrorCode = windowError(window, now);
+    const unavailable = (errorCode: string): AccountReadResult => ({ account: null, errorCode, period: null, periodErrorCode: periodErrorCode ?? errorCode });
     if (this.accountId !== accountId) { this.readers.clear(); this.accountId = accountId; }
-    if (!accountId) return { account: null, errorCode: 'log_identity_mismatch' };
+    if (!accountId) return unavailable('log_identity_mismatch');
     const files: string[] = [];
     try {
       const info = await lstat(this.root);
       if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Linked Codex home');
-    } catch { this.readers.clear(); return { account: null, errorCode: 'log_unavailable' }; }
+    } catch { this.readers.clear(); return unavailable('log_unavailable'); }
     let incomplete = false;
     for (const directory of ['sessions', 'archived_sessions']) incomplete = await this.discover(join(this.root, directory), files) || incomplete;
     const available = new Set(files);
     for (const path of this.readers.keys()) if (!available.has(path)) this.readers.delete(path);
-    const sessions = new Map<string, ChatTokens>();
+    const sessions = new Map<string, { chat: ChatTokens | null; reader: LocalTokenReader }>();
+    const periodCopies = new Map<string, LocalTokenReader[]>();
+    const discoveryIncomplete = incomplete;
+    let unreadableFileIncomplete = false;
     for (const path of files) {
       let reader = this.readers.get(path);
       if (!reader) { reader = new LocalTokenReader(this.root); this.readers.set(path, reader); }
+      if (!periodErrorCode) reader.preparePeriod(window!.startAtMs);
       const result = await reader.readPath(path, accountId);
+      if (result.errorCode === 'log_unavailable') unreadableFileIncomplete = true;
       if (result.errorCode === 'account_logs_incomplete' || result.errorCode === 'log_unavailable') incomplete = true;
       if (reader.state.creatorAccountId === accountId && !reader.state.complete) incomplete = true;
-      if (!result.chat || !reader.state.sessionId) continue;
+      if (reader.state.creatorAccountId !== accountId || !validThreadId(reader.state.sessionId)) continue;
       const sessionId = reader.state.sessionId.toLowerCase(), previous = sessions.get(sessionId);
+      const copies = periodCopies.get(sessionId) ?? []; copies.push(reader); periodCopies.set(sessionId, copies);
       // Active/archived copies and renamed rollouts share a canonical thread ID.
       // Keep one cumulative snapshot rather than summing the copies.
-      if (!previous || result.chat.totalTokens > previous.totalTokens ||
-          (result.chat.totalTokens === previous.totalTokens && result.chat.complete && !previous.complete)) sessions.set(sessionId, result.chat);
+      const score = result.chat?.totalTokens ?? 0, previousScore = previous?.chat?.totalTokens ?? 0;
+      if (!previous || score > previousScore ||
+          (score === previousScore && result.chat?.complete && !previous.chat?.complete)) sessions.set(sessionId, { chat: result.chat, reader });
     }
-    if (!sessions.size) return { account: null, errorCode: incomplete ? 'account_logs_incomplete' : 'no_token_events' };
-    const account: AccountTokens = { ...ZERO, segments: [], updatedAtMs: null, complete: !incomplete, sessionCount: sessions.size };
-    const segments = new Map<string, TokenSegment>();
-    for (const chat of sessions.values()) {
-      for (const field of FIELDS) {
-        const value = counter(account[field] + chat[field]);
-        if (value === null) return { account: null, errorCode: 'counter_overflow' };
-        account[field] = value;
-      }
-      account.complete &&= chat.complete;
-      if (chat.updatedAtMs !== null) account.updatedAtMs = Math.max(account.updatedAtMs ?? chat.updatedAtMs, chat.updatedAtMs);
-      for (const segment of chat.segments) {
-        const key = `${segment.model ?? 'unknown'}:${segment.longContext}`;
-        const merged = segments.get(key) ?? { ...ZERO, model: segment.model, longContext: segment.longContext };
-        for (const field of FIELDS) {
-          const value = counter(merged[field] + segment[field]);
-          if (value === null) return { account: null, errorCode: 'counter_overflow' };
-          merged[field] = value;
+    if (!sessions.size) return unavailable(incomplete ? 'account_logs_incomplete' : 'no_token_events');
+    const chats = [...sessions.values()].flatMap(session => session.chat ? [session.chat] : []);
+    const account = chats.length ? aggregate(chats, incomplete) : null;
+    const errorCode = chats.length && !account ? 'counter_overflow' : incomplete ? 'account_logs_incomplete' : !chats.length ? 'no_token_events' : null;
+    if (periodErrorCode) return { account, errorCode, period: null, periodErrorCode };
+    const periods: ChatTokens[] = [];
+    let periodIncomplete = discoveryIncomplete || unreadableFileIncomplete;
+    for (const copies of periodCopies.values()) {
+      const candidates = copies.map(reader => ({ reader, snapshot: reader.state.periodSnapshot(window!, now) }));
+      if (candidates.some(candidate => !candidate.snapshot)) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
+      candidates.sort((a, b) => b.snapshot!.totalTokens - a.snapshot!.totalTokens || Number(b.snapshot!.complete) - Number(a.snapshot!.complete));
+      const selected = candidates[0], snapshot = selected.snapshot!;
+      const evidence = selected.reader.state.periodEvidence(window!, now);
+      for (const candidate of candidates) {
+        periodIncomplete ||= !candidate.snapshot!.complete;
+        if (candidate === selected || !candidate.snapshot!.totalTokens) continue;
+        // A larger cumulative lifetime value need not contain a rewritten
+        // current-period rollout. Verify current request evidence independently.
+        for (const [key, occurrences] of candidate.reader.state.periodEvidence(window!, now)) {
+          if ((evidence.get(key) ?? 0) < occurrences) { periodIncomplete = true; break; }
         }
-        segments.set(key, merged);
       }
+      if (snapshot.totalTokens > 0) periods.push(snapshot);
     }
-    account.segments = [...segments.values()];
-    return { account, errorCode: incomplete ? 'account_logs_incomplete' : null };
+    const summed = aggregate(periods, periodIncomplete);
+    return { account, errorCode, period: summed ? { ...summed, window: { ...window! } } : null,
+      periodErrorCode: !summed ? 'counter_overflow' : periodIncomplete ? 'period_logs_incomplete' : null };
   }
 }

@@ -22,7 +22,7 @@
     <text x="74" y="51" fill="#c2b6da" font-size="16" font-weight="600" letter-spacing="2">CODEX USAGE / MACOS</text>
     <text x="50" y="132" fill="#f5f3fb" font-size="62" font-weight="650" letter-spacing="-2">Your limits.</text>
     <text x="50" y="198" fill="#bda7ed" font-size="62" font-weight="650" letter-spacing="-2">At a glance.</text>
-    <text x="53" y="244" fill="#aaa3b8" font-size="19">Remaining allowance. Reset times. Account tokens.</text>
+    <text x="53" y="244" fill="#aaa3b8" font-size="19">Remaining allowance. Reset times. 5-hour usage.</text>
     <path d="M53 278h595" stroke="#34303f"/>
     <text x="53" y="307" fill="#c9c4d4" font-size="15">NATIVE MACOS</text>
     <circle cx="203" cy="301" r="2" fill="#786d8b"/>

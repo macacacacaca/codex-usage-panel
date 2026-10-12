@@ -7,14 +7,17 @@ export type ChatTokens = Counters & {
   segments: TokenSegment[]; updatedAtMs: number | null; complete: boolean;
 };
 export type AccountTokens = ChatTokens & { sessionCount: number };
+export type TokenWindow = { startAtMs: number; endAtMs: number; windowMinutes: number };
+export type WindowTokens = AccountTokens & { window: TokenWindow };
 export type TokenProfile = {
   trackingId: string | null; chat: ChatTokens | null; chatErrorCode: string | null;
   account: AccountTokens | null; accountErrorCode: string | null;
+  period: WindowTokens | null; periodErrorCode: string | null;
   lifetimeTokens: number | null; dailyBuckets: Array<{ date: string; tokens: number }>;
   fetchedAtMs: number | null; errorCode: string | null;
 };
 export function emptyTokens(trackingId: string | null = null): TokenProfile {
-  return { trackingId, chat: null, chatErrorCode: null, account: null, accountErrorCode: null, lifetimeTokens: null, dailyBuckets: [], fetchedAtMs: null, errorCode: null };
+  return { trackingId, chat: null, chatErrorCode: null, account: null, accountErrorCode: null, period: null, periodErrorCode: null, lifetimeTokens: null, dailyBuckets: [], fetchedAtMs: null, errorCode: null };
 }
 export function counter(value: unknown): number | null {
   if (typeof value === 'bigint' && value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(value);
@@ -44,9 +47,9 @@ export function normalizeAccountTokens(raw: any, now: number): Pick<TokenProfile
   return { lifetimeTokens: counter(raw?.summary?.lifetimeTokens), dailyBuckets: [...byDate].sort(([a], [b]) => a.localeCompare(b)).map(([date, tokens]) => ({ date, tokens })), fetchedAtMs: now, errorCode: null };
 }
 
-export const PRICE_CHECKED_DATE = '2026-10-08';
+export const PRICE_CHECKED_DATE = '2026-10-12';
 export const PRICE_SOURCE = 'https://developers.openai.com/api/docs/pricing';
-// USD per million model tokens; Standard rates. Source checked 2026-10-08.
+// USD per million model tokens; Standard rates. Source checked 2026-10-12.
 // More than 272K input tokens in one request: 2x input/cache, 1.5x output.
 export const PRICES: Record<string, { input: number; cached: number; write: number; output: number }> = {
   'gpt-6.1-sol': { input: 2, cached: .1, write: 2.5, output: 10 },

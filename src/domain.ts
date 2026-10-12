@@ -1,4 +1,4 @@
-import { emptyTokens, type TokenProfile } from './tokens.ts';
+import { emptyTokens, type TokenProfile, type TokenWindow } from './tokens.ts';
 export type UsageWindow = {
   slot: 'primary' | 'secondary'; label: string; provided: boolean;
   usedPercent: number | null; remainingPercent: number | null;
@@ -59,6 +59,20 @@ export function normalizeUsage(raw: any, plan: unknown, now: number, demo = fals
     fetchedAtMs: now, buckets, resetCreditsAvailable: count !== null && count >= 0 ? Math.floor(count) : null,
     updating: false, errorCode: buckets.length ? null : 'no_usage', demo, nextAttemptAtMs: null, tokens: emptyTokens(),
   };
+}
+/** Use the official Codex 5-hour reset boundary, never a rolling lookback or
+ * another metered bucket's percentage. Expired boundaries need a fresh read. */
+export function tokenWindow(snapshot: Snapshot, now = Date.now()): TokenWindow | null {
+  const bucket = snapshot.buckets.find(bucket => bucket.id === 'codex');
+  const window = bucket?.windows.find(window => window.provided && window.durationMins === 300);
+  const endAtMs = window?.resetsAtMs;
+  if (endAtMs == null || !Number.isFinite(now) || endAtMs <= now) return null;
+  const startAtMs = endAtMs - 300 * 60_000;
+  if (startAtMs > now || startAtMs < 0) return null;
+  return { startAtMs, endAtMs, windowMinutes: 300 };
+}
+export function sameTokenWindow(a: TokenWindow | null, b: TokenWindow | null): boolean {
+  return a === null || b === null ? a === b : a.startAtMs === b.startAtMs && a.endAtMs === b.endAtMs && a.windowMinutes === b.windowMinutes;
 }
 export function percentText(remaining: number | null): string {
   if (remaining === null) return '—';

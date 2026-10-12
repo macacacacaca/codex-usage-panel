@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CodexAdapter, AdapterError } from '../src/adapter.ts';
 import { UsageService } from '../src/service.ts';
-import type { AccountTokens, ChatTokens } from '../src/tokens.ts';
+import { nativePayload } from '../src/native.ts';
+import type { AccountTokens, ChatTokens, TokenWindow, WindowTokens } from '../src/tokens.ts';
 
 const emptyAccountReader = { async read() { return { account: null, errorCode: 'no_token_events' }; } };
 
@@ -13,6 +14,7 @@ class FakeAdapter extends CodexAdapter {
   onRate: (() => void) | null = null;
   failAfter = false;
   tokenFailure = false; tokenReads = 0;
+  quota: any = null;
   override async start() {}
   override async close() { this.closes++; }
   override async request(method: string): Promise<any> {
@@ -29,7 +31,7 @@ class FakeAdapter extends CodexAdapter {
     if (this.gate) await this.gate;
     this.onRate?.();
     if (this.failure) throw new AdapterError(this.failure);
-    return { accountId: this.accountId, rateLimits: { primary: { usedPercent: 24, resetsAt: 1000, windowDurationMins: 300 } } };
+    return { accountId: this.accountId, ...(this.quota ?? { rateLimits: { primary: { usedPercent: 24, resetsAt: 1000, windowDurationMins: 300 } } }) };
   }
 }
 
@@ -244,5 +246,91 @@ test('an account log read failure clears its aggregate without hiding verified q
     assert.equal(service.snapshot.tokens.account, null); assert.equal(service.snapshot.tokens.accountErrorCode, 'log_unavailable');
     assert.equal(service.snapshot.status, 'ready'); assert.equal(service.snapshot.tokens.lifetimeTokens, 100);
     assert.equal(adapter.rates, 1); assert.equal(adapter.tokenReads, 1);
+  } finally { await service.close(); }
+});
+
+const periodNow = Date.parse('2026-10-12T04:00:00Z');
+const setCycle = (adapter: FakeAdapter, end: number) => {
+  adapter.quota = { rateLimits: { limitId: 'codex', primary: { usedPercent: 24, windowDurationMins: 300, resetsAt: end / 1000 } } };
+};
+const fakePeriod = (total: number, window: TokenWindow): WindowTokens => ({ ...fakeAccount(total), window: { ...window } });
+test('native currency and local polling use only current-cycle tokens, never account or lifetime totals', async () => {
+  const adapter = new FakeAdapter(); let now = periodNow, total = 100;
+  setCycle(adapter, now + 2 * 60 * 60_000);
+  const reads: Array<{ window: TokenWindow | null | undefined; now: number | undefined }> = [];
+  const service = new UsageService({ adapter, now: () => now, accountReader: { async read(_account, window, observedNow) {
+    reads.push({ window, now: observedNow });
+    return { account: fakeAccount(100_000_000), errorCode: null, period: window ? fakePeriod(total, window) : null, periodErrorCode: null };
+  } } });
+  try {
+    await service.refresh();
+    assert.equal(service.snapshot.tokens.period?.totalTokens, 100);
+    assert.equal(service.getSnapshot().tokens.periodErrorCode, null);
+    assert.equal(nativePayload(service.getSnapshot(), now).standardUsd, .0002);
+    assert.deepEqual(reads[0], { window: { startAtMs: periodNow - 3 * 60 * 60_000, endAtMs: periodNow + 2 * 60 * 60_000, windowMinutes: 300 }, now: periodNow });
+    const upstreamReads = [adapter.reads, adapter.rates, adapter.tokenReads];
+    total = 250; now += 10_000; service.lastTick = now - 10_000; service.tick(); await service.localInFlight;
+    assert.equal(service.getSnapshot().tokens.period?.totalTokens, 250);
+    assert.equal(nativePayload(service.getSnapshot(), now).standardUsd, .0005);
+    assert.deepEqual([adapter.reads, adapter.rates, adapter.tokenReads], upstreamReads);
+    const clone = service.getSnapshot(); clone.tokens.period!.window.endAtMs = 0; clone.tokens.period!.totalTokens = 0;
+    assert.equal(service.getSnapshot().tokens.period?.totalTokens, 250);
+    const boundary = service.snapshot.tokens.period!.window.endAtMs;
+    now = boundary;
+    assert.equal(service.getSnapshot().tokens.period, null);
+    assert.equal(service.getSnapshot().tokens.periodErrorCode, 'window_expired');
+    assert.equal(nativePayload(service.snapshot, now).standardUsd, null);
+    setCycle(adapter, boundary + 18_000_000); total = 0; await service.refresh();
+    assert.equal(service.getSnapshot().tokens.period?.totalTokens, 0);
+    assert.equal(service.getSnapshot().tokens.period?.window.startAtMs, boundary);
+    assert.equal(nativePayload(service.getSnapshot(), now).standardUsd, 0);
+  } finally { await service.close(); }
+});
+test('a delayed previous-cycle read cannot publish after an official cycle change', async () => {
+  const adapter = new FakeAdapter(); const now = periodNow; const end = now + 60_000; let oldTotal = 40;
+  setCycle(adapter, end);
+  let release = () => {}, gate: Promise<void> | null = null;
+  const published: Array<number | null> = [];
+  const service = new UsageService({ adapter, now: () => now, accountReader: { async read(_account, window) {
+    const captured = window && fakePeriod(window.endAtMs === end ? oldTotal : 20, window);
+    if (gate) await gate;
+    return { account: fakeAccount(1000), errorCode: null, period: captured, periodErrorCode: null };
+  } } });
+  service.on('snapshot', s => published.push(s.tokens.period?.totalTokens ?? null));
+  try {
+    await service.refresh(); published.length = 0;
+    oldTotal = 999;
+    gate = new Promise<void>(resolve => release = resolve);
+    const pending = service.refreshLocalTokens(); await new Promise(resolve => setImmediate(resolve));
+    setCycle(adapter, end + 60_000);
+    const refreshing = service.refresh(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(service.getSnapshot().tokens.period, null);
+    release(); gate = null; await pending; await refreshing;
+    assert.equal(service.getSnapshot().tokens.period?.totalTokens, 20);
+    assert.equal(published.includes(999), false);
+  } finally { release(); gate = null; await service.close(); }
+});
+test('missing interval, mismatched result or incomplete logs never fall back to lifetime currency', async () => {
+  const adapter = new FakeAdapter(); let wrongWindow = false, unavailable = false;
+  setCycle(adapter, periodNow + 60_000);
+  const service = new UsageService({ adapter, now: () => periodNow, accountReader: { async read(_account, window) {
+    return { account: fakeAccount(1_000_000), errorCode: null,
+      period: unavailable ? null : window ? { ...fakePeriod(100, { ...window, endAtMs: window.endAtMs + (wrongWindow ? 1000 : 0) }), complete: false } : null,
+      periodErrorCode: unavailable ? 'log_unavailable' : 'period_logs_incomplete' };
+  } } });
+  try {
+    await service.refresh();
+    assert.equal(service.getSnapshot().tokens.period?.totalTokens, 100);
+    assert.equal(service.getSnapshot().tokens.periodErrorCode, 'period_logs_incomplete');
+    assert.equal(nativePayload(service.getSnapshot(), periodNow).standardUsd, null);
+    wrongWindow = true; await service.refreshLocalTokens();
+    assert.equal(service.getSnapshot().tokens.period, null);
+    unavailable = true; await service.refreshLocalTokens();
+    assert.equal(service.getSnapshot().tokens.periodErrorCode, 'log_unavailable');
+    adapter.quota = { rateLimitsByLimitId: { other: { primary: { usedPercent: 50, windowDurationMins: 300, resetsAt: (periodNow + 60_000) / 1000 } } } };
+    await service.refresh();
+    assert.equal(service.getSnapshot().tokens.period, null);
+    assert.equal(service.getSnapshot().tokens.periodErrorCode, 'window_unavailable');
+    assert.equal(nativePayload(service.getSnapshot(), periodNow).standardUsd, null);
   } finally { await service.close(); }
 });

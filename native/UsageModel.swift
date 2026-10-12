@@ -34,7 +34,7 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
             let (data, response) = try await session.data(from: base.appendingPathComponent("health"))
             if (response as? HTTPURLResponse)?.statusCode == 200 {
                 let health = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                guard (health?["apiVersion"] as? Int) == 2 else { throw PanelError.incompatibleService }
+                guard (health?["apiVersion"] as? Int) == 3 else { throw PanelError.incompatibleService }
                 return
             }
         } catch PanelError.incompatibleService { throw PanelError.incompatibleService }
@@ -95,7 +95,11 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
     var closePanel: (() -> Void)?
     var snapshot: UsageSnapshot? { payload?.snapshot }
     var bucket: UsageBucket? { snapshot?.buckets.first(where: { $0.id == selectedBucket }) ?? snapshot?.buckets.first }
-    var usd: Double? { pricing == "fast" ? payload?.fastUsd : payload?.standardUsd }
+    var period: WindowTokens? { currentPeriod(snapshot, now: now) }
+    var usd: Double? {
+        guard let period, period.complete else { return nil }
+        return pricing == "fast" ? payload?.fastUsd : payload?.standardUsd
+    }
     var old: Bool {
         guard let fetched = snapshot?.fetchedAtMs else { return false }
         return !connected || snapshot?.status != "ready" || now.timeIntervalSince1970 * 1000 - fetched > 120_000
@@ -114,10 +118,10 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
     }
     func window(_ slot: String) -> UsageWindow? { bucket?.windows.first(where: { $0.slot == slot }) }
     var tooltip: String {
-        "Codex 用量（剩餘）\n上行：短期 \(percentage(window("primary")?.remainingPercent))\n下行：每週 \(percentage(window("secondary")?.remainingPercent))\n帳號 Token \(compactTokens(snapshot?.tokens.lifetimeTokens ?? snapshot?.tokens.account?.totalTokens)) · \(dollarText(usd)) 本機 API 等值\n\(status)\n點一下展開；右鍵可退出"
+        "Codex 用量（剩餘）\n上行：短期 \(percentage(window("primary")?.remainingPercent))\n下行：每週 \(percentage(window("secondary")?.remainingPercent))\n本次 5 小時 Token \(compactTokens(period?.totalTokens)) · \(dollarText(usd)) 本次 API 等值\n\(status)\n點一下展開；右鍵可退出"
     }
     func start() {
-        timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in
+        timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect().sink { [weak self] date in
             self?.now = date; self?.changes?()
         }
         stream = Task { [weak self] in await self?.connectLoop() }

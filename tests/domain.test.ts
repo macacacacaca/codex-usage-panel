@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { absoluteTime, backoffMs, countdown, isOld, normalizeUsage, normalizeWindow, percentText, quotaState } from '../src/domain.ts';
+import { absoluteTime, backoffMs, countdown, isOld, normalizeUsage, normalizeWindow, percentText, quotaState, tokenWindow, sameTokenWindow } from '../src/domain.ts';
 
 test('percentages use remaining quota, keep decimals, and distinguish unknown values', () => {
   assert.equal(normalizeWindow({ usedPercent: 24 }, 'primary').remainingPercent, 76);
@@ -48,4 +48,20 @@ test('freshness uses successful fetch time and retry delay is bounded', () => {
   assert.equal(isOld({ ...s, status: 'offline' }, 1100), true);
   assert.deepEqual([1, 2, 3, 4, 5, 6].map(n => backoffMs(n, () => 0)), [15000, 30000, 60000, 120000, 300000, 300000]);
   assert.equal(backoffMs(5, () => 1), 300000);
+});
+test('token interval uses the official Codex five-hour cycle and rejects expired, future or unrelated windows', () => {
+  const now = Date.parse('2026-10-12T04:00:00Z'), reset = now + 2 * 60 * 60_000;
+  const raw = { rateLimitsByLimitId: {
+    other: { primary: { windowDurationMins: 300, resetsAt: (now + 1000) / 1000 } },
+    codex: { primary: { windowDurationMins: 300, resetsAt: reset / 1000 }, secondary: { windowDurationMins: 10080, resetsAt: (now + 86400_000) / 1000 } },
+  } };
+  const snapshot = normalizeUsage(raw, 'plus', now);
+  assert.deepEqual(tokenWindow(snapshot, now), { startAtMs: reset - 18_000_000, endAtMs: reset, windowMinutes: 300 });
+  assert.equal(sameTokenWindow(tokenWindow(snapshot, now), tokenWindow(snapshot, now + 10_000)), true);
+  assert.equal(tokenWindow(snapshot, reset), null);
+  assert.equal(tokenWindow(snapshot, reset - 18_000_001), null);
+  assert.equal(tokenWindow(normalizeUsage({ rateLimitsByLimitId: { other: raw.rateLimitsByLimitId.other } }, 'plus', now), now), null);
+  assert.equal(tokenWindow(normalizeUsage({ rateLimits: { primary: { windowDurationMins: 10080, resetsAt: reset / 1000 } } }, 'plus', now), now), null);
+  assert.equal(tokenWindow(normalizeUsage({ rateLimits: { primary: { windowDurationMins: 300 } } }, 'plus', now), now), null);
+  assert.equal(sameTokenWindow(null, tokenWindow(snapshot, now)), false);
 });

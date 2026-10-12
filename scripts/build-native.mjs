@@ -28,7 +28,7 @@ export async function buildNative({ root = projectRoot, bundle = join(root, 'out
 <key>CFBundleExecutable</key><string>CodexUsage</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>${version}</string>
-<key>CFBundleVersion</key><string>7</string>
+<key>CFBundleVersion</key><string>8</string>
 <key>LSMinimumSystemVersion</key><string>13.5</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

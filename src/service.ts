@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { AdapterError, CodexAdapter } from './adapter.ts';
-import { backoffMs, emptySnapshot, normalizeUsage, type Snapshot } from './domain.ts';
+import { backoffMs, emptySnapshot, normalizeUsage, sameTokenWindow, tokenWindow, type Snapshot } from './domain.ts';
 import { AccountTokenReader, LocalTokenReader } from './local-tokens.ts';
 import { emptyTokens, normalizeAccountTokens, type ChatTokens } from './tokens.ts';
 
@@ -70,6 +70,12 @@ export class UsageService extends EventEmitter {
     // Readers and consumers must not share mutable counters or segment arrays.
     const s = structuredClone(this.snapshot);
     if (s.status === 'ready' && s.fetchedAtMs !== null && this.now() - s.fetchedAtMs > 120_000) s.status = 'stale';
+    const window = tokenWindow(s, this.now());
+    if (!window || s.tokens.period && !sameTokenWindow(s.tokens.period.window, window)) {
+      const expired = s.tokens.period?.window.endAtMs != null && s.tokens.period.window.endAtMs <= this.now();
+      s.tokens.period = null;
+      s.tokens.periodErrorCode = expired ? 'window_expired' : 'window_unavailable';
+    }
     return s;
   }
   invalidate(status: Snapshot['status'] = 'checking', code: string | null = null): void {
@@ -96,17 +102,23 @@ export class UsageService extends EventEmitter {
       return this.localInFlight.then(() => this.refreshLocalTokens());
     }
     const accountId = this.sourceAccountId, id = this.trackingId, generation = this.tokenGeneration;
+    const now = this.now(), window = tokenWindow(this.snapshot, now);
     this.localReadGeneration = generation;
     this.localInFlight = (async () => {
       const [chatResult, accountResult] = await Promise.all([
         id === null ? Promise.resolve({ chat: null, errorCode: 'no_tracked_thread' })
           : Promise.resolve().then(() => this.localReader.read(id, accountId)).catch(() => ({ chat: null, errorCode: 'log_unavailable' })),
-        Promise.resolve().then(() => this.accountReader.read(accountId)).catch(() => ({ account: null, errorCode: 'log_unavailable' })),
+        Promise.resolve().then(() => this.accountReader.read(accountId, window, now)).catch(() => ({ account: null, errorCode: 'log_unavailable', period: null, periodErrorCode: 'log_unavailable' })),
       ]);
       if (this.closed || generation !== this.tokenGeneration || accountId !== this.sourceAccountId || id !== this.trackingId) return;
+      const period = sameTokenWindow(window, tokenWindow(this.snapshot, this.now())) && window &&
+        sameTokenWindow(accountResult.period?.window ?? null, window) ? accountResult.period : null;
       this.snapshot.tokens = { ...this.snapshot.tokens, trackingId: id,
         chat: structuredClone(chatResult.chat), chatErrorCode: chatResult.errorCode,
-        account: structuredClone(accountResult.account), accountErrorCode: accountResult.errorCode };
+        account: structuredClone(accountResult.account), accountErrorCode: accountResult.errorCode,
+        period: structuredClone(period),
+        periodErrorCode: window === null ? 'window_unavailable' : window.endAtMs <= this.now() ? 'window_expired'
+          : accountResult.periodErrorCode ?? (period ? null : 'window_unavailable') };
       this.publish();
     })().finally(() => {
       this.localInFlight = null; this.localReadGeneration = null;
@@ -166,6 +178,7 @@ export class UsageService extends EventEmitter {
         const { segments: _segments, updatedAtMs: _time, complete: _complete, ...counters } = chat;
         chat.segments = [{ ...counters, model: 'gpt-6.1-sol', longContext: false }];
         this.snapshot.tokens = { ...emptyTokens(this.trackingId), chat, account: { ...structuredClone(chat), sessionCount: 3 },
+          period: { ...structuredClone(chat), sessionCount: 3, window: tokenWindow(this.snapshot, now)! },
           ...normalizeAccountTokens({ summary: { lifetimeTokens: 12640000 }, dailyUsageBuckets: [{ startDate: '2026-10-07', tokens: 740000 }] }, now) };
         this.failures = 0; this.publish(); return this.getSnapshot();
       }
@@ -199,9 +212,14 @@ export class UsageService extends EventEmitter {
           this.clearSnapshot('checking'); this.publish();
         }
         const previousTokens = this.snapshot.tokens;
+        const previousWindow = tokenWindow(this.snapshot, this.now());
         this.identity = identity; this.accountKey = key; this.sourceAccountId = raw.accountId;
         this.snapshot = normalizeUsage(raw, after.account.planType, this.now());
         this.snapshot.tokens = { ...previousTokens, ...(accountTokens ?? { errorCode: tokenError }), trackingId: this.trackingId };
+        if (!sameTokenWindow(previousWindow, tokenWindow(this.snapshot, this.now()))) {
+          this.tokenGeneration++;
+          this.snapshot.tokens.period = null; this.snapshot.tokens.periodErrorCode = 'window_unavailable';
+        }
         await this.refreshLocalTokens();
         if (generation !== this.generation) return this.getSnapshot();
       }

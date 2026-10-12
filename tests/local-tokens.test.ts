@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, appendFile, rm, mkdir, rename, symlink, chmod } fro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountTokenReader, LocalTokenReader, TokenLogState, validThreadId } from '../src/local-tokens.ts';
-import { estimateUsd } from '../src/tokens.ts';
+import { estimateUsd, type TokenWindow } from '../src/tokens.ts';
 
 const id = '11111111-2222-3333-4444-555555555555';
 const meta = { type: 'session_meta', payload: { id, creator_account_id: 'account-a', base_instructions: { text: 'PRIVATE CONVERSATION' } } };
@@ -190,5 +190,138 @@ test('invalid owned counters withhold price and rewritten ownership is revalidat
     await writeFile(first, session(id, 'account-b') + line({ type: 'response_item', payload: { content: 'longer replacement record'.repeat(100) } }));
     assert.equal((await f.reader.read('account-a')).account, null);
     assert.equal((await f.reader.read('account-b')).account?.totalTokens, 120);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+const windowStart = Date.parse('2026-10-12T00:00:00Z');
+const currentWindow: TokenWindow = { startAtMs: windowStart, endAtMs: windowStart + 5 * 60 * 60_000, windowMinutes: 300 };
+const observedNow = windowStart + 4 * 60 * 60_000;
+const timedEvent = (atMs: number, total: object, last = total) => ({ ...event(total, last), timestamp: new Date(atMs).toISOString() });
+const ownedMeta = (sessionId = id, accountId = 'account-a') => line({ type: 'session_meta', payload: { id: sessionId, creator_account_id: accountId } });
+
+test('current quota period includes start/observed-time boundaries, excludes old/end/future usage, and preserves model pricing', async () => {
+  const f = await accountFixture();
+  try {
+    const log = ownedMeta() + line(context()) + line(timedEvent(windowStart - 60_000, count(100, 20))) +
+      line(timedEvent(windowStart, count(200, 40), count(100, 20))) + line(context('gpt-6-luna')) +
+      line(timedEvent(observedNow, count(250, 50), count(50, 10))) +
+      line(timedEvent(observedNow + 60_000, count(300, 60), count(50, 10))) +
+      line(timedEvent(currentWindow.endAtMs, count(350, 70), count(50, 10)));
+    await writeFile(join(f.active, `rollout-boundary-${id}.jsonl`), log);
+    await writeFile(join(f.archived, `rollout-copy-${id}.jsonl`), log);
+    await writeFile(join(f.active, `rollout-other-${otherId}.jsonl`), ownedMeta(otherId, 'account-b') + line(context()) + line(timedEvent(windowStart, count(1000, 200))));
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.account?.totalTokens, 420);
+    assert.equal(result.period?.totalTokens, 180); assert.equal(result.period?.sessionCount, 1);
+    assert.equal(result.period?.segments.length, 2); assert.equal(result.period?.complete, true);
+    assert.equal(result.period?.updatedAtMs, observedNow); assert.equal(result.periodErrorCode, null);
+    assert.deepEqual(result.period?.window, currentWindow); assert.notEqual(estimateUsd(result.period), null);
+    assert.equal(JSON.stringify(result.period).includes(id), false); assert.equal(JSON.stringify(result.period).includes('account-a'), false);
+    const other = await f.reader.read('account-b', currentWindow, observedNow);
+    assert.equal(other.period?.totalTokens, 1200);
+    assert.equal((await f.reader.read('account-a', currentWindow, observedNow)).period?.totalTokens, 180);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('period totals increment without rereading old consumption, expire at reset, and recompute a new or earlier window', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-incremental-${id}.jsonl`);
+    await writeFile(path, ownedMeta() + line(context()) + line(timedEvent(windowStart - 1, count(100, 20))));
+    let result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.totalTokens, 0); assert.equal(result.period?.complete, true);
+    assert.equal(result.period?.sessionCount, 0); assert.equal(estimateUsd(result.period), 0);
+    const next = line(timedEvent(windowStart + 60_000, count(150, 30), count(50, 10)));
+    await appendFile(path, next.slice(0, -2));
+    assert.equal((await f.reader.read('account-a', currentWindow, observedNow)).period?.totalTokens, 0);
+    await appendFile(path, next.slice(-2));
+    assert.equal((await f.reader.read('account-a', currentWindow, observedNow)).period?.totalTokens, 60);
+    const expired = await f.reader.read('account-a', currentWindow, currentWindow.endAtMs);
+    assert.equal(expired.period, null); assert.equal(expired.periodErrorCode, 'window_expired');
+    const following = { ...currentWindow, startAtMs: currentWindow.endAtMs, endAtMs: currentWindow.endAtMs + 5 * 60 * 60_000 };
+    result = await f.reader.read('account-a', following, following.startAtMs + 1);
+    assert.equal(result.period?.totalTokens, 0); assert.equal(result.period?.complete, true);
+    assert.equal((await f.reader.read('account-a', currentWindow, observedNow)).period?.totalTokens, 60);
+    assert.equal((await f.reader.read('account-a', null, observedNow)).periodErrorCode, 'window_unavailable');
+    assert.equal((await f.reader.read('account-a', { ...currentWindow, endAtMs: windowStart }, observedNow)).periodErrorCode, 'window_unavailable');
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('old missing price fields do not taint precise current deltas; current gaps and unknown timestamps withhold USD', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-scope-${id}.jsonl`);
+    const old = count(100, 20); delete (old as any).cache_write_input_tokens;
+    const prefix = ownedMeta() + line(context()) + line(timedEvent(windowStart - 60_000, old));
+    await writeFile(path, prefix + line(timedEvent(windowStart + 60_000, count(150, 30), count(50, 10))));
+    const valid = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(valid.account?.complete, false); assert.equal(valid.period?.totalTokens, 60);
+    assert.equal(valid.period?.complete, true); assert.notEqual(estimateUsd(valid.period), null);
+    await appendFile(path, line(timedEvent(windowStart + 120_000, count(300, 60), count(50, 10))));
+    const gap = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(gap.period?.totalTokens, 60); assert.equal(gap.period?.complete, false);
+    assert.equal(gap.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(gap.period), null);
+    const unknown = event(count(200, 40), count(50, 10)); delete (unknown as any).timestamp;
+    await writeFile(path, prefix + line(timedEvent(windowStart + 60_000, count(150, 30), count(50, 10))) + line(unknown));
+    const missing = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(missing.period?.totalTokens, 60); assert.equal(missing.period?.complete, false);
+    assert.equal(estimateUsd(missing.period), null);
+    await writeFile(path, ownedMeta() + line(context()) + line({ ...timedEvent(windowStart - 120_000, count(10, 2)), payload: { type: 'token_count', info: { total_token_usage: { broken: true } } } }) +
+      line(timedEvent(windowStart - 60_000, count(100, 20))) + line(timedEvent(windowStart + 60_000, count(150, 30), count(50, 10))));
+    const oldMalformed = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(oldMalformed.period?.totalTokens, 60); assert.equal(oldMalformed.period?.complete, true);
+    assert.notEqual(estimateUsd(oldMalformed.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('window aggregation deduplicates a current fork and excludes inherited or ambiguous counters', async () => {
+  const f = await accountFixture();
+  try {
+    await writeFile(join(f.active, `rollout-parent-${id}.jsonl`), ownedMeta() + line(context()) + line(timedEvent(windowStart - 60_000, count(100, 20))));
+    const child = line({ type: 'session_meta', payload: { id: secondId, creator_account_id: 'account-a', forked_from_id: id, subagent_history_start_ordinal: 4 } }) +
+      line(meta) + line(context()) + line(timedEvent(windowStart - 60_000, count(100, 20))) +
+      line(context()) + line(timedEvent(windowStart + 60_000, count(150, 30), count(50, 10)));
+    await writeFile(join(f.active, `rollout-child-${secondId}.jsonl`), child);
+    await writeFile(join(f.archived, `rollout-copy-${secondId}.jsonl`), child);
+    const good = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(good.period?.totalTokens, 60); assert.equal(good.period?.sessionCount, 1); assert.equal(good.period?.complete, true);
+    await writeFile(join(f.active, `rollout-ambiguous-${otherId}.jsonl`), line({ type: 'session_meta', payload: { id: otherId, creator_account_id: 'account-a', forked_from_id: id } }) + line(context()) + line(timedEvent(windowStart + 120_000, count(500, 100))));
+    const ambiguous = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(ambiguous.period?.totalTokens, 60); assert.equal(ambiguous.period?.complete, false); assert.equal(estimateUsd(ambiguous.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('an unreadable rollout withholds price for a partial current window', { skip: process.getuid?.() === 0 }, async () => {
+  const f = await accountFixture();
+  const blocked = join(f.active, `rollout-unreadable-${secondId}.jsonl`);
+  try {
+    await writeFile(join(f.active, `rollout-readable-${id}.jsonl`), ownedMeta() + line(context()) + line(timedEvent(windowStart + 60_000, count(100, 20))));
+    await writeFile(blocked, ownedMeta(secondId) + line(context()) + line(timedEvent(windowStart + 60_000, count(50, 10))));
+    await chmod(blocked, 0o000);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.totalTokens, 120); assert.equal(result.period?.complete, false);
+    assert.equal(result.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(result.period), null);
+  } finally { await chmod(blocked, 0o600).catch(() => {}); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('period duplicate selection uses current request evidence rather than larger archived lifetime counters', async () => {
+  const f = await accountFixture();
+  try {
+    const active = join(f.active, `rollout-current-${id}.jsonl`);
+    const archived = join(f.archived, `rollout-old-${id}.jsonl`);
+    await writeFile(archived, ownedMeta() + line(context()) + line(timedEvent(windowStart - 60_000, count(100, 20))));
+    const current = ownedMeta() + line(context()) + line(timedEvent(windowStart + 60_000, count(50, 10)));
+    await writeFile(active, current);
+    const selected = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(selected.account?.totalTokens, 120); assert.equal(selected.period?.totalTokens, 60);
+    assert.equal(selected.period?.complete, true); assert.notEqual(estimateUsd(selected.period), null);
+    await writeFile(archived, current + line(timedEvent(windowStart + 120_000, count(100, 20), count(50, 10))));
+    const subset = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(subset.period?.totalTokens, 120); assert.equal(subset.period?.sessionCount, 1);
+    assert.equal(subset.period?.complete, true); assert.notEqual(estimateUsd(subset.period), null);
+    await writeFile(active, ownedMeta() + line(context()) + line(timedEvent(windowStart + 180_000, count(70, 14))));
+    const conflicting = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(conflicting.period?.totalTokens, 120); assert.equal(conflicting.period?.complete, false);
+    assert.equal(conflicting.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(conflicting.period), null);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });

@@ -5,7 +5,7 @@
 <h1 align="center">Codex Usage</h1>
 
 <p align="center">
-  Remaining allowance, reset countdowns, and account tokens.<br>
+  Remaining allowance, reset countdowns, and 5-hour consumption.<br>
   A small native panel that stays in your macOS menu bar.
 </p>
 
@@ -30,7 +30,7 @@
 </p>
 
 <p align="center">
-  <sub>v0.3.2 usage screenshot · Traditional Chinese interface · Taipei time</sub>
+  <sub>Previous UI (v0.3.2) · Traditional Chinese interface · Taipei time</sub>
 </p>
 
 **Your allowance, at a glance.** Two rows of percentages show the remaining short-term and weekly allowance in a compact **32 pt** menu bar indicator. One click opens the **336 × 330 pt** panel. It follows your macOS light or dark appearance.
@@ -38,19 +38,21 @@
 | In the menu bar | Inside the panel |
 | :--- | :--- |
 | Remaining short-term allowance | Reset countdowns and exact reset times |
-| Remaining weekly allowance | Token total for the currently signed-in account |
-| A compact indicator with no Dock icon | Local input/output details and an estimated USD equivalent |
+| Remaining weekly allowance | Tokens consumed in the current 5-hour quota period |
+| A compact indicator with no Dock icon | The same period's local input/output details and API USD estimate |
 
-The main token total uses the official account lifetime total when available, or verified local logs for the current account as a fallback. Input/output details and USD estimates cover that account's logs **on this Mac**, including archived sessions; they may cover less usage than the official total. **The USD value is an API pricing estimate, not a ChatGPT/Codex subscription bill or an actual charge.**
+**One quota period, one usage estimate.** The period starts five hours before the official reset time and ends at that reset. Token counts and USD estimates sum verified request activity for the signed-in account **on this Mac**, including archived sessions, within those boundaries. This follows the current quota period rather than a rolling “last five hours” or a lifetime total.
+
+Quota percentages come from Codex; tokens come from local records. Percentages are never converted into token counts or dollars. **USD is an API pricing estimate, not a ChatGPT/Codex subscription bill or an actual charge.** Missing period boundaries show unavailable usage; incomplete records show a labelled subtotal with no USD estimate. Cross-device or cloud activity may be absent from local records.
 
 ## Quick start
 
 ### 1. Download for your Mac
 
-| Your Mac | Download v0.3.3 |
+| Your Mac | Download v0.3.4 |
 | :--- | :--- |
-| Apple Silicon — M1, M2, M3, M4, or later | [Apple Silicon app · arm64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.3/CodexUsage-v0.3.3-macos-arm64.zip) |
-| Intel | [Intel app · x86_64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.3/CodexUsage-v0.3.3-macos-x86_64.zip) |
+| Apple Silicon — M1, M2, M3, M4, or later | [Apple Silicon app · arm64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.4/CodexUsage-v0.3.4-macos-arm64.zip) |
+| Intel | [Intel app · x86_64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.4/CodexUsage-v0.3.4-macos-x86_64.zip) |
 
 Requires **macOS 13.5 or later** and an installed **Codex app or CLI signed in with ChatGPT**. Release apps include Node.js **24.21.0** and the local data service; you do not need Node.js, npm, or Apple Command Line Tools to run them. Codex itself is not bundled. Find checksums and release notes on the [Releases page](https://github.com/macacacacaca/codex-usage-panel/releases/latest).
 
@@ -62,7 +64,7 @@ Requires **macOS 13.5 or later** and an installed **Codex app or CLI signed in w
 
 ### 3. Follow your signed-in account
 
-The panel follows your current Codex sign-in automatically. **No chat ID setup is needed.** Account changes or sign-out clear the previous account's counters; local sessions with an unverified owner are excluded. Release packages contain **no credentials, session records, or personal runtime settings**.
+The panel follows your current Codex sign-in automatically and counts local consumption in the active 5-hour quota period. **No chat ID setup is needed.** Account changes or sign-out clear the previous account's counters; local sessions with an unverified owner are excluded. Release packages contain **no credentials, session records, or personal runtime settings**.
 
 It runs as a standalone macOS app, with a Traditional Chinese interface and Taipei time. Official account data can arrive later than local activity; the panel does not guarantee immediate cloud updates.
 
@@ -96,7 +98,7 @@ The build creates an ad hoc signed app for your Mac's architecture. A regular so
 - **Adjust pricing:** select API Standard or Fast in settings. This changes the estimate's pricing scenario.
 - **Quit:** choose Quit in settings or right-click the menu bar indicator.
 
-The native app refreshes official account limits and token summaries every **60 seconds**; the current account's local token aggregate updates every **10 seconds**. Automatic launch at login is not configured. Source users can also use the [launch script](./啟動用量面板.command), which builds on first use, and the [stop script](./停止用量面板.command).
+The native app refreshes official account limits every **60 seconds**; local consumption within the current quota period updates every **10 seconds**. Automatic launch at login is not configured. Source users can also use the [launch script](./啟動用量面板.command), which builds on first use, and the [stop script](./停止用量面板.command).
 
 If the menu bar is crowded, switch to Finder, then hold **⌘** and drag the indicator toward the clock. See the [full usage guide](./docs/guide.md#launch-and-quit) for service management and menu bar limitations.
 
@@ -106,7 +108,7 @@ The panel reuses sign-in managed by Codex CLI and reads usage through the offici
 
 - **Local service:** binds to `127.0.0.1`, validates request origins, and requires same-origin JSON for writes.
 - **Account isolation:** verifies identity before and after reads; account email and IDs stay out of the frontend and logs.
-- **Limited chat data:** aggregates only verified sessions belonging to the current account, including archived local sessions. Keeps only identity, model information, and token counters while reading; regular messages are skipped.
+- **Limited chat data:** counts request deltas in the active quota period from verified current-account sessions, including archived local sessions. Keeps only identity, timestamps, model information, and token counters while reading; regular messages are skipped.
 - **Minimal storage:** token values are not saved separately. Runtime files contain process metadata, with no credential or account snapshots. Release builds contain no personal settings or session records.
 
 Use this as a local tool for your macOS user. Do not expose the service to the internet through a proxy, tunnel, or port forwarding. See [security and privacy guidance](./SECURITY.md) (Traditional Chinese) for protections and private vulnerability reporting.
@@ -117,7 +119,7 @@ Use this as a local tool for your macOS user. Do not expose the service to the i
 | :--- | :--- |
 | [User guide](./docs/guide.md#launch-and-quit) | Launch, quit, settings, menu bar placement, and runtime files |
 | [Data and refresh behavior](./docs/guide.md#data-features-and-web-development-version) | Native refresh intervals, the web development version, and recovery |
-| [Tokens and USD estimates](./docs/guide.md#tokens-and-usd-equivalent) | Official account totals, local details, account checks, and pricing assumptions |
+| [Tokens and USD estimates](./docs/guide.md#tokens-and-usd-equivalent) | Current quota period, local request deltas, account checks, and pricing assumptions |
 | [Sign-in and data sources](./docs/guide.md#sign-in-and-data-sources) | App Server protocol, identity checks, and local HTTP boundaries |
 | [Development](./docs/development.md) | Commands, source map, testing, and secret scanning |
 | [Known limitations](./docs/guide.md#known-limitations) | CLI compatibility, polling, and unsupported features |
