@@ -6,7 +6,7 @@ Detailed behavior, data sources, pricing, and limitations for the native app and
 
 ## Install a Release
 
-Download the Apple Silicon or Intel ZIP for your Mac from [GitHub Releases](https://github.com/macacacacaca/codex-usage-panel/releases/latest), unzip it, move `CodexUsage.app` to Applications, and open it. Releases require macOS 13.5+ and an installed Codex app or CLI signed in with ChatGPT. They include Node.js 24.21.0 and the local service, so no development tools are needed. They do not include Codex, credentials, session records, or personal runtime settings. Version 0.3.4 follows your signed-in account and shows local consumption within its current 5-hour quota period; no chat ID is required.
+Download the Apple Silicon or Intel ZIP for your Mac from [GitHub Releases](https://github.com/macacacacaca/codex-usage-panel/releases/latest), unzip it, move `CodexUsage.app` to Applications, and open it. Releases require macOS 13.5+ and an installed Codex app or CLI signed in with ChatGPT. They include Node.js 24.21.0 and the local service, so no development tools are needed. They do not include Codex, credentials, session records, or personal runtime settings. Version 0.3.5 follows your signed-in account and shows local consumption within its current 5-hour quota period; no chat ID is required.
 
 The app is ad hoc signed and has no Developer ID signature or Apple notarization. If the first launch is blocked, try opening it, then use **System Settings → Privacy & Security → Open Anyway** and confirm **Open** if you trust the download. [Apple documents this per-app exception](https://support.apple.com/102445).
 
@@ -25,7 +25,7 @@ Token Details opens a separate page with input, cached input, output, total toke
 
 The visual design in version 0.3.2 takes inspiration from [Reflect's Awwwards entry](https://www.awwwards.com/sites/reflect): adaptive dark and light backgrounds, thin lavender and muted blue progress bars, subtle borders, and separate font sizes for numbers and percentage signs. Click anywhere on the main token card to see details. API Standard/Fast pricing scenarios and Quit are available in the upper-right settings page. The panel remains 336 × 330 pt, with a 32 pt menu bar indicator.
 
-The app manages its local data service automatically. HTTP/SSE is used for internal data transfer, so users do not need to open a URL. Native process records and startup logs that exclude sensitive data are stored in `~/Library/Application Support/CodexUsage/runtime/`. Native pricing preferences are stored in UserDefaults; token data is not saved separately. Older installations can retain legacy tracking settings, but version 0.3.4 requires no manual chat selection. If an older service occupies port 4317, quit the old app before opening the new version.
+The app manages its local data service automatically. HTTP/SSE is used for internal data transfer, so users do not need to open a URL. Native process records and startup logs that exclude sensitive data are stored in `~/Library/Application Support/CodexUsage/runtime/`. Native pricing preferences are stored in UserDefaults; token data is not saved separately. Older installations can retain legacy tracking settings, but version 0.3.5 requires no manual chat selection. If an older service occupies port 4317, quit the old app before opening the new version.
 
 Release packages bundle Node.js **24.21.0**. Local validation used that version on Apple Silicon. The app prefers the CLI executable bundled with the local Codex or ChatGPT app.
 
@@ -51,6 +51,14 @@ Token consumption follows the currently verified Codex account's **active 5-hour
 
 The main count, input/output details, and USD estimate use **per-request token deltas** from the current account's verified `sessions/` and `archived_sessions/` records on this Mac. Cumulative session counters are used to verify deltas, not added as lifetime totals. Model, cache, and output pricing applies only to included requests in this interval. No manual chat ID is required; account changes or sign-out clear previous counters.
 
+### Free Auto-Review Checks
+
+For ChatGPT sign-ins, OpenAI treats auto-review safety checks as free and outside plan usage limits. [OpenAI's guidance](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan). Version 0.3.5 recognizes the exact local model ID `codex-auto-review`, removes its request deltas from current-period consumption and pricing segments, and reports them separately as excluded safety-review tokens in details.
+
+When a period contains a supported paid model and these free checks, the paid requests can receive a USD estimate without treating the checks as an unknown paid model. Supported paid requests still use official API rates. Other unknown model IDs remain unpriced; the app does not substitute a model alias or reference rate. Missing or incomplete data can still withhold USD.
+
+### Local Scope and Pricing
+
 **Local consumption has a narrower scope than account quota.** Other-device and cloud activity may consume quota without producing records on this Mac. The app does not infer tokens or dollars from quota percentages, and account lifetime totals are not used for the current-period count or estimate. Official quota updates can lag activity.
 
 If no unexpired 300-minute Codex window is available, consumption is unavailable. Missing reset information, an expired reset, or ambiguous quota categories cannot define a period. Missing request timestamps, counter gaps, unreadable records, or incomplete pricing metadata can leave a labelled token subtotal; USD is withheld rather than pricing partial data.
@@ -61,7 +69,7 @@ When reading Codex session JSONL records, the service retains only session ident
 
 The estimated USD equivalent uses [official API pricing](https://developers.openai.com/api/docs/pricing). **It is not a ChatGPT/Codex subscription bill or an actual charge.** API Standard is the default pricing scenario; Fast (2×) can be selected in settings. This is a user-selected pricing scenario, not an indication of the execution speed recorded in the session. Pricing was checked on **2026-10-12**, with support for `gpt-6.1-sol`, `gpt-6-astra`, and `gpt-6-luna`. For a single request with more than 272,000 input tokens, input, cached input, and cache-write rates are multiplied by 2, and output rates by 1.5, before applying the selected scenario.
 
-For each included request: `(uncached input × input rate + cached input × cached-input rate + cache writes × cache-write rate + output × output rate) ÷ 1,000,000`; the panel sums those estimates within the period. Uncached input excludes cached input and cache writes. Reasoning tokens are already included in output and are not added again. If timestamps, counters, the model, token breakdown, events, or per-request length are incomplete, the app shows “—” instead of a partial price. Estimates exclude tools, storage, regional surcharges, and other charges. Update `src/tokens.ts` when prices change.
+For each included paid request: `(uncached input × input rate + cached input × cached-input rate + cache writes × cache-write rate + output × output rate) ÷ 1,000,000`; the panel sums those estimates within the period. Uncached input excludes cached input and cache writes. Reasoning tokens are already included in output and are not added again. Free `codex-auto-review` requests are excluded before this sum. If timestamps, counters, the model, token breakdown, events, or per-request length are incomplete, the app shows “—” instead of a partial price. Estimates exclude tools, storage, regional surcharges, and other charges. Update `src/tokens.ts` when prices change.
 
 The quota period is revalidated against the current time and refreshed account limits. At reset, the app waits for a valid new interval rather than showing the previous period as current. Local aggregation updates every 10 seconds, but polling does not guarantee immediate cloud data or a cross-device token breakdown.
 

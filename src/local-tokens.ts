@@ -11,10 +11,12 @@ export function validThreadId(id: unknown): id is string {
 const ZERO: Counters = { inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
 const FIELDS = Object.keys(ZERO) as Array<keyof Counters>;
 type PeriodEntry = { atMs: number; segment: TokenSegment; sourceTotal: Counters; complete: boolean };
+type PeriodSnapshot = ChatTokens & { excludedReviewTokens: number };
 type PeriodUncertainty = { fromMs: number | null; toMs: number | null };
 type AccountReadResult = { account: AccountTokens | null; errorCode: string | null; period: WindowTokens | null; periodErrorCode: string | null };
 const MAX_PERIOD_ENTRIES = 20_000;
 const MAX_PERIOD_UNCERTAINTIES = 256;
+const FREE_REVIEW_MODEL = 'codex-auto-review';
 
 function aggregate(snapshots: ChatTokens[], incomplete = false): AccountTokens | null {
   const result: AccountTokens = { ...ZERO, segments: [], updatedAtMs: null, complete: !incomplete, sessionCount: snapshots.length };
@@ -106,16 +108,26 @@ export class TokenLogState {
     this.pendingUncertainties = this.pendingUncertainties.filter(gap => gap.toMs === null);
     this.retainPeriodFrom(this.periodRetainFromMs);
   }
-  periodSnapshot(window: TokenWindow, now: number): ChatTokens | null {
+  periodSnapshot(window: TokenWindow, now: number): PeriodSnapshot | null {
     const entries = this.periodEntries.filter(entry => entry.atMs >= window.startAtMs && entry.atMs < window.endAtMs && entry.atMs <= now);
     const incomplete = this.periodUncertainties.some(gap =>
       (gap.toMs === null || gap.toMs >= window.startAtMs) && (gap.fromMs === null || (gap.fromMs < window.endAtMs && gap.fromMs <= now)));
-    return aggregate(entries.map(entry => ({ ...entry.segment, segments: [{ ...entry.segment }], complete: entry.complete, updatedAtMs: entry.atMs })), incomplete);
+    let excludedReviewTokens = 0;
+    const paid = entries.filter(entry => entry.segment.model !== FREE_REVIEW_MODEL);
+    for (const entry of entries) if (entry.segment.model === FREE_REVIEW_MODEL) {
+      const next = counter(excludedReviewTokens + entry.segment.totalTokens); if (next === null) return null;
+      excludedReviewTokens = next;
+    }
+    const snapshot = aggregate(paid.map(entry => ({ ...entry.segment, segments: [{ ...entry.segment }], complete: entry.complete, updatedAtMs: entry.atMs })), incomplete);
+    return snapshot ? { ...snapshot, excludedReviewTokens } : null;
   }
   periodEvidence(window: TokenWindow, now: number): Map<string, number> {
     const evidence = new Map<string, number>();
     for (const entry of this.periodEntries) {
       if (entry.atMs < window.startAtMs || entry.atMs >= window.endAtMs || entry.atMs > now) continue;
+      // Copy conflicts in known free review events do not invalidate an exact
+      // paid request. Cumulative parsing and ownership validation are unchanged.
+      if (entry.segment.model === FREE_REVIEW_MODEL) continue;
       const key = createHash('sha256').update(JSON.stringify([entry.atMs, entry.segment.model, entry.segment.longContext,
         ...FIELDS.map(field => entry.segment[field]), ...FIELDS.map(field => entry.sourceTotal[field])])).digest('hex');
       evidence.set(key, (evidence.get(key) ?? 0) + 1);
@@ -207,7 +219,9 @@ export class TokenLogState {
       for (const field of FIELDS) segment[field] += delta[field];
       this.segments.set(key, segment); this.total = ownTotal; this.rawTotal = next;
       if (!exact) this.uncertain(this.rawAtMs, atMs);
-      else if (atMs === null) this.uncertain(this.rawAtMs, null);
+      // An undated event cannot inherit the previous row's lower time bound:
+      // that timestamp may itself be in the future after a clock adjustment.
+      else if (atMs === null) this.uncertain(null, null);
       else if (atMs >= this.periodRetainFromMs) {
         this.periodEntries.push({ atMs, segment: { ...delta, model: this.model, longContext }, sourceTotal: { ...next }, complete: priced });
         if (this.periodEntries.length > MAX_PERIOD_ENTRIES) {
@@ -387,12 +401,20 @@ export class AccountTokenReader {
     const errorCode = chats.length && !account ? 'counter_overflow' : incomplete ? 'account_logs_incomplete' : !chats.length ? 'no_token_events' : null;
     if (periodErrorCode) return { account, errorCode, period: null, periodErrorCode };
     const periods: ChatTokens[] = [];
+    let excludedReviewTokens = 0;
     let periodIncomplete = discoveryIncomplete || unreadableFileIncomplete;
     for (const copies of periodCopies.values()) {
       const candidates = copies.map(reader => ({ reader, snapshot: reader.state.periodSnapshot(window!, now) }));
       if (candidates.some(candidate => !candidate.snapshot)) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
-      candidates.sort((a, b) => b.snapshot!.totalTokens - a.snapshot!.totalTokens || Number(b.snapshot!.complete) - Number(a.snapshot!.complete));
+      candidates.sort((a, b) => b.snapshot!.totalTokens - a.snapshot!.totalTokens ||
+        b.snapshot!.excludedReviewTokens - a.snapshot!.excludedReviewTokens || Number(b.snapshot!.complete) - Number(a.snapshot!.complete));
       const selected = candidates[0], snapshot = selected.snapshot!;
+      // Keep one verified review subtotal per canonical session, including when
+      // the fullest review copy differs from the fullest paid copy.
+      const reviewSubtotal = Math.max(...candidates.map(candidate => candidate.snapshot!.excludedReviewTokens));
+      const reviewTotal = counter(excludedReviewTokens + reviewSubtotal);
+      if (reviewTotal === null) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
+      excludedReviewTokens = reviewTotal;
       const evidence = selected.reader.state.periodEvidence(window!, now);
       for (const candidate of candidates) {
         periodIncomplete ||= !candidate.snapshot!.complete;
@@ -406,7 +428,7 @@ export class AccountTokenReader {
       if (snapshot.totalTokens > 0) periods.push(snapshot);
     }
     const summed = aggregate(periods, periodIncomplete);
-    return { account, errorCode, period: summed ? { ...summed, window: { ...window! } } : null,
+    return { account, errorCode, period: summed ? { ...summed, excludedReviewTokens, window: { ...window! } } : null,
       periodErrorCode: !summed ? 'counter_overflow' : periodIncomplete ? 'period_logs_incomplete' : null };
   }
 }

@@ -30,6 +30,7 @@ struct WindowTokens: Decodable {
     let updatedAtMs: Double?
     let complete: Bool
     let sessionCount: Int
+    let excludedReviewTokens: Int64?
     let window: TokenWindow
 }
 struct TokenProfile: Decodable {
@@ -49,6 +50,7 @@ struct NativePayload: Decodable {
     let snapshot: UsageSnapshot
     let standardUsd: Double?
     let fastUsd: Double?
+    let standardUsdReason: String?
     let priceDate: String
 }
 

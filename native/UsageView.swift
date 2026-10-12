@@ -91,7 +91,7 @@ struct UsageView: View {
                     }
                     Button { page = .details } label: { tokenSummary }
                         .buttonStyle(TokenCardStyle())
-                        .help("查看本次 5 小時的輸入、快取、輸出與價格明細")
+                        .help("查看本次 5 小時的輸入、快取、輸出與價格明細\(model.excludedReviewTokens > 0 ? "；不含免費安全審核 \(compactTokens(model.excludedReviewTokens)) Token" : "")")
                         .accessibilityLabel("查看本次 5 小時明細，\(compactTokens(model.period?.totalTokens)) Token，美元等值 \(dollarText(model.usd))")
                 }.padding(1)
             }.scrollIndicators(.hidden)
@@ -154,9 +154,15 @@ struct UsageView: View {
                         Rectangle().fill(PanelStyle.line).frame(height: 0.5)
                         detail("輸出（含推理）", chat.outputTokens)
                         detail("其中推理", chat.reasoningOutputTokens)
+                        Rectangle().fill(PanelStyle.line).frame(height: 0.5)
+                        detail("免費安全審核（未計入）", chat.excludedReviewTokens ?? 0)
                     }.padding(10)
                     .background(PanelStyle.surface, in: RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(PanelStyle.line, lineWidth: 0.5))
+                    if (chat.excludedReviewTokens ?? 0) > 0 {
+                        Text("自動安全審核免費且不消耗 Codex 額度，因此未計入本次 Token 與美元。")
+                            .font(.system(size: 10)).foregroundStyle(PanelStyle.muted).fixedSize(horizontal: false, vertical: true)
+                    }
                     HStack {
                         Text("每 10 秒讀取本機新紀錄")
                         Spacer()
@@ -172,6 +178,9 @@ struct UsageView: View {
                 if model.period?.complete == false || model.snapshot?.tokens.periodErrorCode == "period_logs_incomplete" {
                     Text("資料不完整，僅顯示可核對的 Token 小計，美元等值暫不估算。")
                         .font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
+                }
+                if let reason = model.usdUnavailableReason {
+                    Text(reason).font(.system(size: 10)).foregroundStyle(PanelStyle.muted)
                 }
                 detail("單價核對", model.payload?.priceDate ?? "—")
             }.padding(1)
@@ -239,7 +248,8 @@ struct UsageView: View {
             }
         }
         if model.period?.complete == false { return "本次可核對 Token 小計 · 資料不完整 · 暫不估價" }
-        return "本次本機 \(model.pricing == "fast" ? "Fast × 2" : "Standard") 等值 · 非帳單\(model.usd == nil ? " · 資料不足" : "")"
+        if let reason = model.usdUnavailableReason { return reason }
+        return "本次本機 \(model.pricing == "fast" ? "Fast × 2" : "Standard") 等值 · 非帳單"
     }
     func detail(_ name: String, _ value: Int64) -> some View { detail(name, value.formatted(.number)) }
     func detail(_ name: String, _ value: String) -> some View {

@@ -178,7 +178,7 @@ export class UsageService extends EventEmitter {
         const { segments: _segments, updatedAtMs: _time, complete: _complete, ...counters } = chat;
         chat.segments = [{ ...counters, model: 'gpt-6.1-sol', longContext: false }];
         this.snapshot.tokens = { ...emptyTokens(this.trackingId), chat, account: { ...structuredClone(chat), sessionCount: 3 },
-          period: { ...structuredClone(chat), sessionCount: 3, window: tokenWindow(this.snapshot, now)! },
+          period: { ...structuredClone(chat), sessionCount: 3, window: tokenWindow(this.snapshot, now)!, excludedReviewTokens: 0 },
           ...normalizeAccountTokens({ summary: { lifetimeTokens: 12640000 }, dailyUsageBuckets: [{ startDate: '2026-10-07', tokens: 740000 }] }, now) };
         this.failures = 0; this.publish(); return this.getSnapshot();
       }

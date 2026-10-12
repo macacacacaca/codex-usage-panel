@@ -105,14 +105,18 @@ function render() {
   const tokens = snapshot.tokens, expectedWindow = tokenWindow(snapshot);
   const period = tokens.period && sameTokenWindow(tokens.period.window, expectedWindow) ? tokens.period : null;
   const usd = estimateUsd(period, settings.pricing), total = period?.totalTokens ?? null;
+  const excludedReviewTokens = period?.excludedReviewTokens ?? 0;
+  const unknownModels = [...new Set(period?.segments.filter(segment => segment.model !== null && !Object.hasOwn(PRICES, segment.model)).map(segment => segment.model!) ?? [])];
+  const usdUnavailableReason = period?.complete && usd === null
+    ? unknownModels.length ? '尚無該模型公開 API 單價' : '缺少完整計價資料，暫不估價' : null;
   text('token-total', tokenText(total));
-  $('token-total').title = total !== null ? `${total.toLocaleString('en-US')} tokens（本次 5 小時內的本機${period?.complete ? '紀錄' : '可核對小計'}）` : '尚無可核對的本次 5 小時 Token';
+  $('token-total').title = total !== null ? `${total.toLocaleString('en-US')} tokens（本次 5 小時內的本機${period?.complete ? '紀錄' : '可核對小計'}）${excludedReviewTokens > 0 ? `；不含免費安全審核 ${excludedReviewTokens.toLocaleString('en-US')} Token` : ''}` : '尚無可核對的本次 5 小時 Token';
   text('token-usd', usdText(usd));
-  $('token-usd').title = usd === null ? '缺少完整模型或 Token 拆分，暫不估價' : `US$${usd.toFixed(6)}（API 單價等值）`;
+  $('token-usd').title = usd === null ? usdUnavailableReason ?? '缺少完整模型或 Token 拆分，暫不估價' : `US$${usd.toFixed(6)}（API 單價等值${excludedReviewTokens > 0 ? '；不含免費安全審核' : ''}）`;
   const tokenError = tokens.period && !period
     ? tokens.period.window.endAtMs <= Date.now() ? '正在確認新的 5 小時區間…' : '尚無有效的 5 小時額度區間'
     : { window_unavailable: '尚無有效的 5 小時額度區間', window_expired: '正在確認新的 5 小時區間…', no_token_events: '目前帳號尚無可核對的本機紀錄', log_unavailable: '暫時無法讀取本機紀錄', period_logs_incomplete: '部分本次紀錄無法完整核對', counter_overflow: '無法核對本次 Token 總量', log_identity_mismatch: '無法確認本次紀錄的帳號' }[tokens.periodErrorCode ?? ''];
-  text('token-note', period ? !period.complete ? '本次可核對 Token 小計 · 資料不完整 · 暫不估價' : `本次本機 API ${settings.pricing === 'fast' ? 'Fast' : 'Standard'} 等值 · 非帳單${usd === null ? ' · 資料不足' : ''}${snapshot.status === 'offline' ? ' · 上次資料' : ''}` : tokenError ?? '正在取得本次 5 小時 Token');
+  text('token-note', period ? !period.complete ? '本次可核對 Token 小計 · 資料不完整 · 暫不估價' : usdUnavailableReason ?? `本次本機 API ${settings.pricing === 'fast' ? 'Fast' : 'Standard'} 等值 · 非帳單${snapshot.status === 'offline' ? ' · 上次資料' : ''}` : tokenError ?? '正在取得本次 5 小時 Token');
   const newDetailSignature = JSON.stringify([current, snapshot.resetCreditsAvailable, snapshot.status, tokens, period?.window ?? null, settings.pricing, settings.timeZone]);
   if (detailSignature !== newDetailSignature) {
     detailSignature = newDetailSignature;
@@ -127,16 +131,19 @@ function render() {
     if (period) {
       fields.push(['本次區間開始', absoluteTime(period.window.startAtMs, 'Asia/Taipei')], ['本次區間結束', absoluteTime(period.window.endAtMs, 'Asia/Taipei')]);
       fields.push(['本次 · 本機聊天數', count(period.sessionCount)], ['本次 · 一般輸入', count(period.inputTokens - period.cachedInputTokens - period.cacheWriteInputTokens)], ['本次 · 快取輸入', count(period.cachedInputTokens)], ['本次 · 快取寫入', count(period.cacheWriteInputTokens)], ['本次 · 輸出', count(period.outputTokens)], ['其中推理輸出', count(period.reasoningOutputTokens)], [period.complete ? '本次 · Token 總計' : '本次 · 可核對 Token 小計', count(period.totalTokens)]);
+      fields.push(['免費安全審核（未計入）', count(excludedReviewTokens)]);
+      if (excludedReviewTokens > 0) fields.push(['安全審核用量說明', '自動安全審核免費且不消耗 Codex 額度，未計入本次 Token 與美元']);
       fields.push(['本次 Token 紀錄時間', period.updatedAtMs === null ? '未提供' : absoluteTime(period.updatedAtMs, 'Asia/Taipei')]);
       const models = [...new Set(period.segments.map(segment => segment.model ?? '未提供'))];
       fields.push(['紀錄中的模型', models.join('、')], ['估價方式', `API ${settings.pricing === 'fast' ? 'Fast（Standard × 2）' : 'Standard'}`]);
       for (const model of models) {
-        const p = PRICES[model];
+        const p = Object.hasOwn(PRICES, model) ? PRICES[model] : null;
         if (p) fields.push([`${model} · 每百萬 Token`, `Standard 輸入 $${p.input}／快取 $${p.cached}／寫入 $${p.write}／輸出 $${p.output}`]);
       }
       fields.push(['單價核對日期', PRICE_CHECKED_DATE], ['長上下文計價', '單次輸入 > 272K：輸入與快取 × 2、輸出 × 1.5']);
       if (!period.complete) fields.push(['Token 完整性', '資料不完整，僅顯示可核對小計；美元暫不估算']);
-      if (usd === null) fields.push(['美元估算', '模型、單次請求或拆分不完整，暫不估價']);
+      if (usd === null) fields.push(['美元估算', usdUnavailableReason ?? '模型、單次請求或拆分不完整，暫不估價']);
+      if (period.complete && unknownModels.length) fields.push(['尚無公開 API 單價的模型', unknownModels.join('、')]);
     } else fields.push(['本次 5 小時 Token', tokenError ?? '尚未取得可核對的本次紀錄']);
     fields.push(['Token 與美元範圍', '官方 Codex 5 小時重置區間內、目前帳號在這台 Mac 的紀錄；不含其他裝置']);
     if (!fields.length) fields.push(['用量資料', '未提供']);

@@ -325,3 +325,95 @@ test('period duplicate selection uses current request evidence rather than large
     assert.equal(conflicting.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(conflicting.period), null);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
+
+test('free safety reviews are excluded from counted period tokens without breaking paid deltas around them', async () => {
+  const f = await accountFixture();
+  try {
+    const log = ownedMeta() + line(context('codex-auto-review')) + line(timedEvent(windowStart, count(100, 20))) +
+      line(context()) + line(timedEvent(windowStart + 60_000, count(200, 40), count(100, 20))) +
+      line(context('codex-auto-review')) + line(timedEvent(windowStart + 120_000, count(250, 50), count(50, 10))) +
+      line(context()) + line(timedEvent(windowStart + 180_000, count(300, 60), count(50, 10)));
+    await writeFile(join(f.active, `rollout-mixed-${id}.jsonl`), log);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.account?.totalTokens, 360); // Legacy cumulative accounting is unchanged.
+    assert.equal(result.period?.totalTokens, 180); assert.equal(result.period?.inputTokens, 150);
+    assert.equal(result.period?.outputTokens, 30); assert.equal(result.period?.excludedReviewTokens, 180);
+    assert.equal(result.period?.sessionCount, 1); assert.equal(result.period?.complete, true);
+    assert.deepEqual(result.period?.segments.map(segment => segment.model), ['gpt-6.1-sol']);
+    assert.equal(estimateUsd(result.period), 0.0006);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('review-only periods are zero-cost and duplicate copies preserve one complete excluded subtotal', async () => {
+  const f = await accountFixture();
+  try {
+    const first = count(100, 20), next = count(150, 30), last = count(50, 10);
+    for (const value of [first, next, last]) delete (value as any).cache_write_input_tokens;
+    const prefix = ownedMeta() + line(context('codex-auto-review')) + line(timedEvent(windowStart + 60_000, first));
+    const full = prefix + line(timedEvent(windowStart + 120_000, next, last));
+    await writeFile(join(f.active, `rollout-review-${id}.jsonl`), full);
+    await writeFile(join(f.archived, `rollout-review-prefix-${id}.jsonl`), prefix);
+    let result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.totalTokens, 0); assert.equal(result.period?.segments.length, 0);
+    assert.equal(result.period?.sessionCount, 0); assert.equal(result.period?.excludedReviewTokens, 180);
+    assert.equal(result.period?.complete, true); assert.equal(estimateUsd(result.period), 0);
+    assert.equal(result.account?.complete, false); // Free price-field omissions do not taint paid scope.
+    await writeFile(join(f.archived, `rollout-review-prefix-${id}.jsonl`), full);
+    result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.excludedReviewTokens, 180); assert.equal(estimateUsd(result.period), 0);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('excluded reviews obey period/time boundaries and unknown timestamps remain conservative', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-review-time-${id}.jsonl`);
+    const prefix = ownedMeta() + line(context('codex-auto-review')) + line(timedEvent(windowStart - 1, count(100, 20))) +
+      line(timedEvent(windowStart, count(200, 40), count(100, 20))) +
+      line(timedEvent(observedNow, count(250, 50), count(50, 10))) +
+      line(timedEvent(observedNow + 60_000, count(300, 60), count(50, 10))) +
+      line(timedEvent(currentWindow.endAtMs, count(350, 70), count(50, 10)));
+    await writeFile(path, prefix);
+    const bounded = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(bounded.period?.totalTokens, 0); assert.equal(bounded.period?.excludedReviewTokens, 180);
+    assert.equal(bounded.period?.complete, true); assert.equal(estimateUsd(bounded.period), 0);
+    const unknown = timedEvent(windowStart + 180_000, count(400, 80), count(50, 10)); delete (unknown as any).timestamp;
+    await appendFile(path, line(unknown));
+    const partial = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(partial.period?.totalTokens, 0); assert.equal(partial.period?.excludedReviewTokens, 180);
+    // The missing time cannot safely be assigned to the current interval.
+    assert.equal(partial.period?.complete, false); assert.equal(estimateUsd(partial.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('known free copy differences do not invalidate identical paid evidence; other unknown models remain unpriced', async () => {
+  const f = await accountFixture();
+  try {
+    const active = join(f.active, `rollout-paid-review-${id}.jsonl`);
+    const archived = join(f.archived, `rollout-paid-review-copy-${id}.jsonl`);
+    const paid = ownedMeta() + line(context()) + line(timedEvent(windowStart + 60_000, count(50, 10)));
+    await writeFile(active, paid + line(context('codex-auto-review')) + line(timedEvent(windowStart + 120_000, count(100, 20), count(50, 10))));
+    await writeFile(archived, paid + line(context('codex-auto-review')) + line(timedEvent(windowStart + 180_000, count(120, 24), count(70, 14))));
+    const copies = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(copies.period?.totalTokens, 60); assert.equal(copies.period?.excludedReviewTokens, 84);
+    assert.equal(copies.period?.complete, true); assert.notEqual(estimateUsd(copies.period), null);
+    await rm(archived);
+    await writeFile(active, ownedMeta() + line(context('codex-auto-review-other')) + line(timedEvent(windowStart + 60_000, count(50, 10))));
+    const unknown = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(unknown.period?.totalTokens, 60); assert.equal(unknown.period?.excludedReviewTokens, 0);
+    assert.equal(estimateUsd(unknown.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('unresolved cumulative gaps across paid/review events do not create a free classification shortcut', async () => {
+  const f = await accountFixture();
+  try {
+    await writeFile(join(f.active, `rollout-paid-review-gap-${id}.jsonl`), ownedMeta() + line(context()) +
+      line(timedEvent(windowStart + 60_000, count(50, 10))) + line(context('codex-auto-review')) +
+      line(timedEvent(windowStart + 120_000, count(300, 60), count(100, 20))));
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.totalTokens, 60); assert.equal(result.period?.excludedReviewTokens, 0);
+    assert.equal(result.period?.complete, false); assert.equal(estimateUsd(result.period), null);
+    assert.equal(result.periodErrorCode, 'period_logs_incomplete');
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});

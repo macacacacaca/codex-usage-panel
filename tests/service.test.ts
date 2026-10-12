@@ -253,7 +253,7 @@ const periodNow = Date.parse('2026-10-12T04:00:00Z');
 const setCycle = (adapter: FakeAdapter, end: number) => {
   adapter.quota = { rateLimits: { limitId: 'codex', primary: { usedPercent: 24, windowDurationMins: 300, resetsAt: end / 1000 } } };
 };
-const fakePeriod = (total: number, window: TokenWindow): WindowTokens => ({ ...fakeAccount(total), window: { ...window } });
+const fakePeriod = (total: number, window: TokenWindow): WindowTokens => ({ ...fakeAccount(total), window: { ...window }, excludedReviewTokens: 0 });
 test('native currency and local polling use only current-cycle tokens, never account or lifetime totals', async () => {
   const adapter = new FakeAdapter(); let now = periodNow, total = 100;
   setCycle(adapter, now + 2 * 60 * 60_000);
@@ -332,5 +332,22 @@ test('missing interval, mismatched result or incomplete logs never fall back to 
     assert.equal(service.getSnapshot().tokens.period, null);
     assert.equal(service.getSnapshot().tokens.periodErrorCode, 'window_unavailable');
     assert.equal(nativePayload(service.getSnapshot(), periodNow).standardUsd, null);
+  } finally { await service.close(); }
+});
+
+test('native pricing explains unlisted models without misclassifying complete token data', async () => {
+  const adapter = new FakeAdapter(); setCycle(adapter, periodNow + 60_000);
+  const service = new UsageService({ adapter, now: () => periodNow, accountReader: { async read(_account, window) {
+    const period = window ? fakePeriod(100, window) : null;
+    if (period) period.segments[0].model = 'unlisted-model';
+    return { account: fakeAccount(100), errorCode: null, period, periodErrorCode: null };
+  } } });
+  try {
+    await service.refresh();
+    const payload = nativePayload(service.getSnapshot(), periodNow);
+    assert.equal(payload.snapshot.tokens.period?.complete, true);
+    assert.equal(payload.standardUsd, null);
+    assert.equal(payload.standardUsdReason, 'unknown_model');
+    assert.equal(nativePayload(service.getSnapshot(), periodNow + 60_000).standardUsdReason, null);
   } finally { await service.close(); }
 });

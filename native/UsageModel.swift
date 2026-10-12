@@ -34,7 +34,7 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
             let (data, response) = try await session.data(from: base.appendingPathComponent("health"))
             if (response as? HTTPURLResponse)?.statusCode == 200 {
                 let health = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                guard (health?["apiVersion"] as? Int) == 3 else { throw PanelError.incompatibleService }
+                guard (health?["apiVersion"] as? Int) == 4 else { throw PanelError.incompatibleService }
                 return
             }
         } catch PanelError.incompatibleService { throw PanelError.incompatibleService }
@@ -100,6 +100,11 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
         guard let period, period.complete else { return nil }
         return pricing == "fast" ? payload?.fastUsd : payload?.standardUsd
     }
+    var usdUnavailableReason: String? {
+        guard let period, period.complete, usd == nil else { return nil }
+        return payload?.standardUsdReason == "unknown_model" ? "尚無該模型公開 API 單價" : "缺少完整計價資料，暫不估價"
+    }
+    var excludedReviewTokens: Int64 { period?.excludedReviewTokens ?? 0 }
     var old: Bool {
         guard let fetched = snapshot?.fetchedAtMs else { return false }
         return !connected || snapshot?.status != "ready" || now.timeIntervalSince1970 * 1000 - fetched > 120_000
@@ -118,7 +123,7 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
     }
     func window(_ slot: String) -> UsageWindow? { bucket?.windows.first(where: { $0.slot == slot }) }
     var tooltip: String {
-        "Codex 用量（剩餘）\n上行：短期 \(percentage(window("primary")?.remainingPercent))\n下行：每週 \(percentage(window("secondary")?.remainingPercent))\n本次 5 小時 Token \(compactTokens(period?.totalTokens)) · \(dollarText(usd)) 本次 API 等值\n\(status)\n點一下展開；右鍵可退出"
+        "Codex 用量（剩餘）\n上行：短期 \(percentage(window("primary")?.remainingPercent))\n下行：每週 \(percentage(window("secondary")?.remainingPercent))\n本次 5 小時 Token \(compactTokens(period?.totalTokens)) · \(dollarText(usd)) 本次 API 等值\(excludedReviewTokens > 0 ? "\n不含免費安全審核 \(compactTokens(excludedReviewTokens)) Token（不消耗額度）" : "")\n\(status)\n點一下展開；右鍵可退出"
     }
     func start() {
         timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect().sink { [weak self] date in

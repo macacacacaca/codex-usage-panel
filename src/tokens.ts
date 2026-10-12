@@ -8,7 +8,7 @@ export type ChatTokens = Counters & {
 };
 export type AccountTokens = ChatTokens & { sessionCount: number };
 export type TokenWindow = { startAtMs: number; endAtMs: number; windowMinutes: number };
-export type WindowTokens = AccountTokens & { window: TokenWindow };
+export type WindowTokens = AccountTokens & { window: TokenWindow; excludedReviewTokens: number };
 export type TokenProfile = {
   trackingId: string | null; chat: ChatTokens | null; chatErrorCode: string | null;
   account: AccountTokens | null; accountErrorCode: string | null;
@@ -60,7 +60,7 @@ export function estimateUsd(chat: ChatTokens | null, mode: 'standard' | 'fast' =
   if (!chat || !chat.complete) return null;
   let total = 0, coveredTokens = 0;
   for (const segment of chat.segments) {
-    const prices = segment.model ? PRICES[segment.model] : null;
+    const prices = segment.model && Object.hasOwn(PRICES, segment.model) ? PRICES[segment.model] : null;
     if (!prices || segment.longContext === null) return null;
     const baseInput = segment.inputTokens - segment.cachedInputTokens - segment.cacheWriteInputTokens;
     if (baseInput < 0) return null;

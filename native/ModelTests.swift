@@ -20,12 +20,21 @@ import Foundation
         let model = UsageModel()
         model.payload = periodPayload; model.now = Date(timeIntervalSince1970: 1); model.pricing = "standard"
         precondition(model.period?.sessionCount == 2 && model.period?.totalTokens == 120 && model.usd == 2)
+        precondition(model.excludedReviewTokens == 0)
         precondition(model.tooltip.contains("本次 5 小時 Token 120") && !model.tooltip.contains("999999"))
+        model.payload = try JSONDecoder().decode(NativePayload.self, from: Data(periodFixture.replacingOccurrences(of: "\"sessionCount\":2", with: "\"sessionCount\":2,\"excludedReviewTokens\":400").utf8))
+        precondition(model.period?.excludedReviewTokens == 400 && model.period?.totalTokens == 120 && model.usd == 2)
+        precondition(model.tooltip.contains("不含免費安全審核 400 Token（不消耗額度）"))
         model.now = Date(timeIntervalSince1970: 18_001)
-        precondition(model.period == nil && model.usd == nil)
+        precondition(model.period == nil && model.usd == nil && model.excludedReviewTokens == 0)
         model.now = Date(timeIntervalSince1970: 0)
         precondition(model.period == nil && model.usd == nil)
         model.now = Date(timeIntervalSince1970: 1)
+        let unknownPriceFixture = periodFixture.replacingOccurrences(of: "\"standardUsd\":2,\"fastUsd\":4", with: "\"standardUsd\":null,\"fastUsd\":null,\"standardUsdReason\":\"unknown_model\"")
+        model.payload = try JSONDecoder().decode(NativePayload.self, from: Data(unknownPriceFixture.utf8))
+        precondition(model.period?.complete == true && model.usd == nil && model.usdUnavailableReason == "尚無該模型公開 API 單價")
+        model.payload = try JSONDecoder().decode(NativePayload.self, from: Data(unknownPriceFixture.replacingOccurrences(of: "\"complete\":true", with: "\"complete\":false").utf8))
+        precondition(model.period?.complete == false && model.usd == nil && model.usdUnavailableReason == nil)
         model.payload = try JSONDecoder().decode(NativePayload.self, from: Data(periodFixture.replacingOccurrences(of: "\"complete\":true", with: "\"complete\":false").utf8))
         precondition(model.period?.totalTokens == 120 && model.usd == nil)
         model.payload = try JSONDecoder().decode(NativePayload.self, from: Data(periodFixture.replacingOccurrences(of: "\"resetsAtMs\":18001000", with: "\"resetsAtMs\":null").utf8))
@@ -43,7 +52,14 @@ import Foundation
         emptyObject["standardUsd"] = 0; emptyObject["fastUsd"] = 0
         model.payload = try JSONDecoder().decode(NativePayload.self, from: JSONSerialization.data(withJSONObject: emptyObject))
         precondition(model.period?.totalTokens == 0 && model.period?.sessionCount == 0 && model.usd == 0)
+        precondition(model.excludedReviewTokens == 0)
         precondition(compactTokens(model.period?.totalTokens) == "0" && dollarText(model.usd) == "US$0.00")
+        var freeOnlyPeriod = emptyTokens["period"] as! [String: Any]
+        freeOnlyPeriod["excludedReviewTokens"] = 500
+        emptyTokens["period"] = freeOnlyPeriod; emptySnapshot["tokens"] = emptyTokens; emptyObject["snapshot"] = emptySnapshot
+        model.payload = try JSONDecoder().decode(NativePayload.self, from: JSONSerialization.data(withJSONObject: emptyObject))
+        precondition(model.period?.totalTokens == 0 && model.usd == 0 && model.excludedReviewTokens == 500)
+        precondition(model.tooltip.contains("本次 5 小時 Token 0") && model.tooltip.contains("免費安全審核 500 Token"))
         model.payload = decoded
         precondition(model.period == nil && model.usd == nil)
         let resources = URL(fileURLWithPath: "/Applications/Example.app/Contents/Resources")
