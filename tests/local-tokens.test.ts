@@ -364,7 +364,7 @@ test('review-only periods are zero-cost and duplicate copies preserve one comple
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('excluded reviews obey period/time boundaries and unknown timestamps remain conservative', async () => {
+test('excluded reviews obey period/time boundaries without assigning undated free events to paid scope', async () => {
   const f = await accountFixture();
   try {
     const path = join(f.active, `rollout-review-time-${id}.jsonl`);
@@ -381,8 +381,12 @@ test('excluded reviews obey period/time boundaries and unknown timestamps remain
     await appendFile(path, line(unknown));
     const partial = await f.reader.read('account-a', currentWindow, observedNow);
     assert.equal(partial.period?.totalTokens, 0); assert.equal(partial.period?.excludedReviewTokens, 180);
-    // The missing time cannot safely be assigned to the current interval.
-    assert.equal(partial.period?.complete, false); assert.equal(estimateUsd(partial.period), null);
+    // Undated reviews are free regardless of when they occurred, but their
+    // excluded subtotal cannot safely be assigned to this interval.
+    assert.equal(partial.period?.complete, true); assert.equal(estimateUsd(partial.period), 0);
+    await writeFile(path, prefix.replace('codex-auto-review', 'gpt-6.1-sol') + line(unknown));
+    const undatedPaid = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(undatedPaid.period?.complete, false); assert.equal(estimateUsd(undatedPaid.period), null);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -415,5 +419,88 @@ test('unresolved cumulative gaps across paid/review events do not create a free 
     assert.equal(result.period?.totalTokens, 60); assert.equal(result.period?.excludedReviewTokens, 0);
     assert.equal(result.period?.complete, false); assert.equal(estimateUsd(result.period), null);
     assert.equal(result.periodErrorCode, 'period_logs_incomplete');
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('an undated exact free review advances the raw baseline without blocking paid requests before and after it', async () => {
+  const f = await accountFixture();
+  try {
+    const review = event(count(150, 30), count(50, 10)); delete (review as any).timestamp;
+    const log = ownedMeta() + line(context()) + line(timedEvent(windowStart + 60_000, count(100, 20))) +
+      line(context('codex-auto-review')) + line(review) + line(context()) +
+      line(timedEvent(windowStart + 120_000, count(200, 40), count(50, 10)));
+    await writeFile(join(f.active, `rollout-undated-review-${id}.jsonl`), log);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.account?.totalTokens, 240); assert.equal(result.period?.totalTokens, 180);
+    assert.equal(result.period?.excludedReviewTokens, 0); assert.equal(result.period?.complete, true);
+    assert.notEqual(estimateUsd(result.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+const largeDummyText = 'DUMMY CONTENT '.repeat(310_000);
+test('an undated free review is not assigned to an interval starting at the Unix epoch', () => {
+  const state = new TokenLogState(0);
+  const review = event(count(50, 10)); delete (review as any).timestamp;
+  [meta, context('codex-auto-review'), review].forEach(row => state.accept(line(row)));
+  const period = state.periodSnapshot({ startAtMs: 0, endAtMs: 300 * 60_000, windowMinutes: 300 }, 60_000);
+  assert.equal(period?.excludedReviewTokens, 0); assert.equal(period?.totalTokens, 0);
+  assert.equal(period?.complete, true); assert.equal(estimateUsd(period), 0);
+});
+
+test('oversized ordinary records preserve paid pricing across chunks and ignore nested or escaped fake discriminators', async () => {
+  const f = await accountFixture();
+  try {
+    const paid = ownedMeta() + line(context()) + line(timedEvent(windowStart + 60_000, count(100, 20)));
+    const paddingRow = line({ type: 'response_item', payload: { content: 'padding' } });
+    const padding = (65_536 - 20 - (Buffer.byteLength(paid) + Buffer.byteLength(paddingRow)) % 65_536 + 65_536) % 65_536;
+    const aligned = paid + paddingRow.slice(0, -1) + ' '.repeat(padding) + '\n';
+    const ordinary = line({ type: 'response_item', payload: { type: 'turn_context', model: 'fake-model', nested: { type: 'token_count' }, text: largeDummyText } });
+    const escaped = ordinary.replace('"type":"response_item"', '"\\u0074ype":"response_item"');
+    const userMessage = line({ type: 'event_msg', payload: { type: 'user_message', message: largeDummyText, nested: { type: 'token_count' } } });
+    const itemCompleted = line({ type: 'event_msg', payload: { type: 'item_completed', item: { type: 'function_call_output', output: largeDummyText, nested: { type: 'token_count' } } } });
+    await writeFile(join(f.active, `rollout-ordinary-large-${id}.jsonl`), aligned + ordinary + escaped + userMessage + itemCompleted + line(timedEvent(windowStart + 120_000, count(150, 30), count(50, 10))));
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.totalTokens, 180); assert.equal(result.period?.complete, true);
+    assert.notEqual(estimateUsd(result.period), null); assert.equal(JSON.stringify(result).includes('DUMMY'), false);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('oversized relevant, malformed, late-discriminator and duplicate-discriminator records remain conservative', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-relevant-large-${id}.jsonl`);
+    const paid = ownedMeta() + line(context()) + line(timedEvent(windowStart + 60_000, count(100, 20)));
+    const following = line(timedEvent(windowStart + 120_000, count(150, 30), count(50, 10)));
+    const ordinaryPayload = JSON.stringify({ content: largeDummyText });
+    const variants = [
+      line({ type: 'turn_context', payload: { model: 'gpt-6-luna', type: 'response_item', text: largeDummyText } }),
+      `{"type":"response_item","payload":${ordinaryPayload},"type":"turn_context"}\n`,
+      line({ payload: { content: largeDummyText }, type: 'response_item' }),
+      `{"type":"response_item","payload":{"content":"${largeDummyText}\n`,
+      line({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: count(100, 20), last_token_usage: count(100, 20) }, text: largeDummyText } }),
+    ];
+    for (const oversized of variants) {
+      await writeFile(path, paid + oversized + following);
+      const result = await f.reader.read('account-a', currentWindow, observedNow);
+      assert.equal(result.period?.complete, false); assert.equal(estimateUsd(result.period), null);
+      assert.equal(result.periodErrorCode, 'period_logs_incomplete');
+    }
+    await writeFile(path, paid + variants[0] + following);
+    const missedModel = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(missedModel.period?.segments.some(segment => segment.model === null), true);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('skipping an oversized ordinary inherited record preserves the child fork ordinal boundary', async () => {
+  const f = await accountFixture();
+  try {
+    const log = line({ type: 'session_meta', payload: { id: secondId, creator_account_id: 'account-a', forked_from_id: id, subagent_history_start_ordinal: 6 } }) +
+      line(meta) + line(context()) + line(timedEvent(windowStart - 60_000, count(100, 20))) +
+      line({ type: 'response_item', payload: { content: largeDummyText } }) + line(context()) +
+      line(timedEvent(windowStart + 60_000, count(150, 30), count(50, 10)));
+    await writeFile(join(f.active, `rollout-fork-large-${secondId}.jsonl`), log);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.period?.totalTokens, 60); assert.equal(result.period?.complete, true);
+    assert.notEqual(estimateUsd(result.period), null);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });

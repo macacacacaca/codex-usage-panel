@@ -34,7 +34,7 @@ func backendExecutablePath(resourceRoot: URL, inheritedPath: String?) -> String 
             let (data, response) = try await session.data(from: base.appendingPathComponent("health"))
             if (response as? HTTPURLResponse)?.statusCode == 200 {
                 let health = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                guard (health?["apiVersion"] as? Int) == 4 else { throw PanelError.incompatibleService }
+                guard (health?["apiVersion"] as? Int) == 5 else { throw PanelError.incompatibleService }
                 return
             }
         } catch PanelError.incompatibleService { throw PanelError.incompatibleService }

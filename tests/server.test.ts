@@ -9,8 +9,8 @@ test('loopback API enforces Host/Origin, exposes no account identifiers, support
   const origin = await app.listen();
   try {
     const health = await (await fetch(`${origin}/health`)).json();
-    assert.equal(health.apiVersion, 4);
-    assert.equal(health.version, '0.3.5');
+    assert.equal(health.apiVersion, 5);
+    assert.equal(health.version, '0.3.6');
     assert.equal((await fetch(`${origin}/api/usage`, { headers: { Origin: 'https://example.com' } })).status, 403);
     const wrongHostStatus = await new Promise(resolve => {
       const req = httpRequest(`${origin}/api/usage`, { headers: { Host: 'evil.example' } }, res => { res.resume(); resolve(res.statusCode); });

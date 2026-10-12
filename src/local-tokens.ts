@@ -18,6 +18,136 @@ const MAX_PERIOD_ENTRIES = 20_000;
 const MAX_PERIOD_UNCERTAINTIES = 256;
 const FREE_REVIEW_MODEL = 'codex-auto-review';
 
+type JsonFrame = { kind: 'object' | 'array'; expect: 'keyOrEnd' | 'key' | 'colon' | 'valueOrEnd' | 'value' | 'commaOrEnd'; scope: 'root' | 'payload' | 'other'; key: 'type' | 'payload' | null };
+/** Scans oversized records structurally without retaining message values.
+ * Discriminators must be in the first 8 KiB. A later duplicate discriminator
+ * invalidates an early header instead of overriding it silently. */
+class OversizedRecordHeader {
+  private frames: JsonFrame[] = [];
+  private root: 'value' | 'done' = 'value';
+  private mode: 'string' | 'number' | 'literal' | null = null;
+  private bytes = 0;
+  private invalid = false;
+  private escaped = false;
+  private unicodeRemaining = 0;
+  private capture: number[] | null = null;
+  private stringRole: 'key' | 'type' | 'other' = 'other';
+  private stringScope: JsonFrame['scope'] = 'other';
+  private numeric = '';
+  private literal = '';
+  private literalOffset = 0;
+  private topType: string | null = null;
+  private eventType: string | null = null;
+  private typeKeys = 0;
+  private payloadKeys = 0;
+  private eventTypeKeys = 0;
+  feed(chunk: Buffer): void {
+    // Search unretained string bodies in native code. This keeps large image
+    // and tool-output strings from paying a JavaScript call per payload byte.
+    // Latin-1 gives one character per byte, so header offsets stay exact.
+    const text = chunk.toString('latin1'), delimiters = /["\\\x00-\x1f]/g;
+    let position = 0;
+    while (position < chunk.length) {
+      if (this.invalid) { this.bytes += chunk.length - position; return; }
+      if (this.mode === 'string' && this.capture === null && !this.escaped && !this.unicodeRemaining) {
+        delimiters.lastIndex = position;
+        const boundary = delimiters.exec(text)?.index ?? chunk.length;
+        this.bytes += boundary - position; position = boundary;
+        if (position === chunk.length) return;
+      }
+      this.bytes++; this.consume(chunk[position++]);
+    }
+  }
+  private finishNumber(): boolean { return ['zero', 'integer', 'fraction', 'exponentDigits'].includes(this.numeric); }
+  private consume(byte: number): void {
+    if (this.mode === 'string') {
+      if (this.capture) { if (this.capture.length < 256) this.capture.push(byte); else this.capture = null; }
+      if (this.unicodeRemaining) {
+        if (!((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102))) this.invalid = true;
+        else this.unicodeRemaining--;
+        return;
+      }
+      if (this.escaped) {
+        this.escaped = false;
+        if (byte === 117) this.unicodeRemaining = 4;
+        else if (![34, 92, 47, 98, 102, 110, 114, 116].includes(byte)) this.invalid = true;
+        return;
+      }
+      if (byte === 92) { this.escaped = true; return; }
+      if (byte < 32) { this.invalid = true; return; }
+      if (byte !== 34) return;
+      this.mode = null;
+      let value: string | null = null;
+      if (this.capture) { try { value = JSON.parse(Buffer.from(this.capture).toString('utf8')); } catch { this.invalid = true; } }
+      this.capture = null;
+      const frame = this.frames.at(-1);
+      if (this.stringRole === 'key' && frame) {
+        frame.key = value === 'type' || value === 'payload' ? value : null; frame.expect = 'colon';
+        if (frame.scope === 'root' && frame.key === 'type') this.typeKeys++;
+        if (frame.scope === 'root' && frame.key === 'payload') this.payloadKeys++;
+        if (frame.scope === 'payload' && frame.key === 'type') this.eventTypeKeys++;
+      } else if (this.stringRole === 'type' && this.bytes <= 8_192) {
+        if (this.stringScope === 'root') this.topType = value;
+        else if (this.stringScope === 'payload') this.eventType = value;
+      }
+      return;
+    }
+    if (this.mode === 'literal') {
+      if (byte !== this.literal.charCodeAt(this.literalOffset++)) { this.invalid = true; return; }
+      if (this.literalOffset === this.literal.length) this.mode = null;
+      return;
+    }
+    if (this.mode === 'number') {
+      if (byte >= 48 && byte <= 57) {
+        if (this.numeric === 'minus') this.numeric = byte === 48 ? 'zero' : 'integer';
+        else if (this.numeric === 'zero') this.invalid = true;
+        else if (this.numeric === 'dot') this.numeric = 'fraction';
+        else if (this.numeric === 'exponent' || this.numeric === 'exponentSign') this.numeric = 'exponentDigits';
+        return;
+      }
+      if (byte === 46 && (this.numeric === 'zero' || this.numeric === 'integer')) { this.numeric = 'dot'; return; }
+      if ((byte === 101 || byte === 69) && ['zero', 'integer', 'fraction'].includes(this.numeric)) { this.numeric = 'exponent'; return; }
+      if ((byte === 43 || byte === 45) && this.numeric === 'exponent') { this.numeric = 'exponentSign'; return; }
+      if (!this.finishNumber()) { this.invalid = true; return; }
+      this.mode = null;
+    }
+    if ([32, 9, 10, 13].includes(byte)) return;
+    const frame = this.frames.at(-1);
+    if (frame?.kind === 'object' && (frame.expect === 'keyOrEnd' || frame.expect === 'key')) {
+      if (byte === 125 && frame.expect === 'keyOrEnd') { this.frames.pop(); return; }
+      if (byte !== 34) { this.invalid = true; return; }
+      this.mode = 'string'; this.stringRole = 'key'; this.stringScope = frame.scope;
+      this.capture = frame.scope === 'other' ? null : [34]; return;
+    }
+    if (frame?.expect === 'colon') { if (byte !== 58) this.invalid = true; else frame.expect = 'value'; return; }
+    if (frame?.expect === 'commaOrEnd') {
+      if (byte === 44) { frame.expect = frame.kind === 'object' ? 'key' : 'value'; return; }
+      if (byte === (frame.kind === 'object' ? 125 : 93)) { this.frames.pop(); return; }
+      this.invalid = true; return;
+    }
+    if (frame?.kind === 'array' && frame.expect === 'valueOrEnd' && byte === 93) { this.frames.pop(); return; }
+    if (!frame && this.root === 'done') { this.invalid = true; return; }
+    const scope: JsonFrame['scope'] = !frame ? 'root' : frame.scope === 'root' && frame.key === 'payload' ? 'payload' : 'other';
+    this.stringRole = frame?.key === 'type' && frame.scope !== 'other' ? 'type' : 'other';
+    this.stringScope = frame?.scope ?? 'other';
+    if (frame) frame.expect = 'commaOrEnd'; else this.root = 'done';
+    if (byte === 123 || byte === 91) {
+      if (this.frames.length >= 128) { this.invalid = true; return; }
+      this.frames.push({ kind: byte === 123 ? 'object' : 'array', expect: byte === 123 ? 'keyOrEnd' : 'valueOrEnd', scope: byte === 123 ? scope : 'other', key: null }); return;
+    }
+    if (byte === 34) { this.mode = 'string'; this.capture = this.stringRole === 'type' ? [34] : null; return; }
+    if (byte === 116 || byte === 102 || byte === 110) { this.mode = 'literal'; this.literal = byte === 116 ? 'true' : byte === 102 ? 'false' : 'null'; this.literalOffset = 1; return; }
+    if (byte === 45 || (byte >= 48 && byte <= 57)) { this.mode = 'number'; this.numeric = byte === 45 ? 'minus' : byte === 48 ? 'zero' : 'integer'; return; }
+    this.invalid = true;
+  }
+  finish(): { unrelated: boolean; clearModel: boolean } {
+    const valid = !this.invalid && !this.frames.length && this.root === 'done' && (this.mode === null || (this.mode === 'number' && this.finishNumber())) && this.typeKeys === 1 && this.payloadKeys <= 1 && this.eventTypeKeys <= 1;
+    const ordinaryEvent = this.topType === 'event_msg' && ['user_message', 'agent_message', 'agent_reasoning', 'agent_reasoning_raw_content', 'item_completed', 'task_started', 'task_complete', 'turn_aborted'].includes(this.eventType ?? '');
+    const unrelated = valid && (this.topType === 'response_item' || this.topType === 'compacted' || ordinaryEvent);
+    return { unrelated, clearModel: !valid || this.topType === 'turn_context' || !['session_meta', 'event_msg', 'response_item', 'compacted'].includes(this.topType ?? '') };
+  }
+}
+
 function aggregate(snapshots: ChatTokens[], incomplete = false): AccountTokens | null {
   const result: AccountTokens = { ...ZERO, segments: [], updatedAtMs: null, complete: !incomplete, sessionCount: snapshots.length };
   const segments = new Map<string, TokenSegment>();
@@ -135,7 +265,12 @@ export class TokenLogState {
     return evidence;
   }
 
-  skipRecord(): void { this.ordinal++; this.complete = false; this.uncertain(this.rawAtMs, null); }
+  skipRecord(unrelated = false, clearModel = true): void {
+    this.ordinal++;
+    if (unrelated) return;
+    this.complete = false; if (clearModel) this.model = null;
+    this.uncertain(this.rawAtMs, null);
+  }
 
   accept(line: string): void {
     const ordinal = this.ordinal++;
@@ -221,8 +356,8 @@ export class TokenLogState {
       if (!exact) this.uncertain(this.rawAtMs, atMs);
       // An undated event cannot inherit the previous row's lower time bound:
       // that timestamp may itself be in the future after a clock adjustment.
-      else if (atMs === null) this.uncertain(null, null);
-      else if (atMs >= this.periodRetainFromMs) {
+      else if (atMs === null && this.model !== FREE_REVIEW_MODEL) this.uncertain(null, null);
+      else if (atMs !== null && atMs >= this.periodRetainFromMs) {
         this.periodEntries.push({ atMs, segment: { ...delta, model: this.model, longContext }, sourceTotal: { ...next }, complete: priced });
         if (this.periodEntries.length > MAX_PERIOD_ENTRIES) {
           const removed = this.periodEntries.splice(0, 1_000);
@@ -304,19 +439,22 @@ export class LocalTokenReader {
       if (info.size > this.offset) {
         // Incremental JSONL parsing. Incomplete final records are reread next time.
         // Oversized unrelated records are skipped without retaining their contents.
-        let position = this.offset, parts: Buffer[] = [], size = 0, skipped = false;
+        let position = this.offset, parts: Buffer[] = [], size = 0, skipped = false, header: OversizedRecordHeader | null = null;
         for await (const chunk of handle.createReadStream({ start: this.offset, end: info.size - 1, autoClose: false })) {
           let start = 0;
           while (start < chunk.length) {
             const end = chunk.indexOf(10, start), stop = end === -1 ? chunk.length : end;
             const part = chunk.subarray(start, stop); size += part.length;
-            if (size > 4_000_000) { skipped = true; parts = []; }
+            if (size > 4_000_000) {
+              if (!skipped) { header = new OversizedRecordHeader(); for (const previousPart of parts) header.feed(previousPart); }
+              header!.feed(part); skipped = true; parts = [];
+            }
             else if (!skipped) parts.push(part);
             if (end === -1) break;
             if (!skipped) this.state.accept(Buffer.concat(parts, size).toString('utf8'));
-            else this.state.skipRecord();
+            else { const classification = header!.finish(); this.state.skipRecord(classification.unrelated, classification.clearModel); }
             this.offset = position + end + 1;
-            parts = []; size = 0; skipped = false; start = end + 1;
+            parts = []; size = 0; skipped = false; header = null; start = end + 1;
           }
           position += chunk.length;
         }

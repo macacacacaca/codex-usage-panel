@@ -33,7 +33,7 @@ export function createUsageServer({ service = new UsageService(), port = 4317,
     try { url = new URL(req.url ?? '/', origin); }
     catch { json(400, { error: 'invalid_request' }); return; }
     if (url.origin !== origin) { json(403, { error: 'forbidden_origin' }); return; }
-    if (req.method === 'GET' && url.pathname === '/health') { json(200, { status: 'ok', version: '0.3.5', apiVersion: 4, instanceId, pid: process.pid }); return; }
+    if (req.method === 'GET' && url.pathname === '/health') { json(200, { status: 'ok', version: '0.3.6', apiVersion: 5, instanceId, pid: process.pid }); return; }
     if (req.method === 'GET' && url.pathname === '/api/usage') { json(200, service.getSnapshot()); return; }
     if (req.method === 'GET' && url.pathname === '/api/native') { json(200, nativePayload(service.getSnapshot())); return; }
     if (req.method === 'POST') {

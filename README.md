@@ -43,18 +43,20 @@
 
 **One quota period, one usage estimate.** The period starts five hours before the official reset time and ends at that reset. Token counts and USD estimates sum verified request activity for the signed-in account **on this Mac**, including archived sessions, within those boundaries. This follows the current quota period rather than a rolling “last five hours” or a lifetime total.
 
-Quota percentages come from Codex; tokens come from local records. Percentages are never converted into token counts or dollars. **USD is an API pricing estimate, not a ChatGPT/Codex subscription bill or an actual charge.** Missing period boundaries show unavailable usage; incomplete records show a labelled subtotal with no USD estimate. Cross-device or cloud activity may be absent from local records.
+Quota percentages come from Codex; tokens come from local records. Percentages are never converted into token counts or dollars. **USD is an API pricing estimate, not a ChatGPT/Codex subscription bill or an actual charge.** Missing period boundaries show unavailable usage; incomplete paid-request records show a labelled subtotal with no USD estimate. Cross-device or cloud activity may be absent from local records.
 
 **Free safety checks stay separate.** OpenAI exempts auto-review safety checks from charges and plan usage limits for ChatGPT sign-ins. [Official guidance](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan). The app excludes the exact `codex-auto-review` model from the period's token count and USD estimate, and shows its excluded tokens separately in details. Supported paid models keep their official API rates.
+
+Large ordinary messages or tool outputs no longer make complete token records appear incomplete. USD remains available when the paid-request evidence is complete; real counter gaps, missing paid timestamps, and unsupported models still prevent an estimate.
 
 ## Quick start
 
 ### 1. Download for your Mac
 
-| Your Mac | Download v0.3.5 |
+| Your Mac | Download v0.3.6 |
 | :--- | :--- |
-| Apple Silicon — M1, M2, M3, M4, or later | [Apple Silicon app · arm64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.5/CodexUsage-v0.3.5-macos-arm64.zip) |
-| Intel | [Intel app · x86_64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.5/CodexUsage-v0.3.5-macos-x86_64.zip) |
+| Apple Silicon — M1, M2, M3, M4, or later | [Apple Silicon app · arm64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.6/CodexUsage-v0.3.6-macos-arm64.zip) |
+| Intel | [Intel app · x86_64](https://github.com/macacacacaca/codex-usage-panel/releases/download/v0.3.6/CodexUsage-v0.3.6-macos-x86_64.zip) |
 
 Requires **macOS 13.5 or later** and an installed **Codex app or CLI signed in with ChatGPT**. Release apps include Node.js **24.21.0** and the local data service; you do not need Node.js, npm, or Apple Command Line Tools to run them. Codex itself is not bundled. Find checksums and release notes on the [Releases page](https://github.com/macacacacaca/codex-usage-panel/releases/latest).
 
