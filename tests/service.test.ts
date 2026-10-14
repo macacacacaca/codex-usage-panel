@@ -9,7 +9,7 @@ const emptyAccountReader = { async read() { return { account: null, errorCode: '
 
 class FakeAdapter extends CodexAdapter {
   reads = 0; rates = 0; closes = 0;
-  email: string | null = 'test@example.com'; accountId: string | null = 'account-a';
+  email: string | null = 'test@example.com'; accountId: string | null | undefined = 'account-a';
   failure: string | null = null; type = 'chatgpt'; gate: Promise<void> | null = null;
   onRate: (() => void) | null = null;
   failAfter = false;
@@ -31,7 +31,7 @@ class FakeAdapter extends CodexAdapter {
     if (this.gate) await this.gate;
     this.onRate?.();
     if (this.failure) throw new AdapterError(this.failure);
-    return { accountId: this.accountId, ...(this.quota ?? { rateLimits: { primary: { usedPercent: 24, resetsAt: 1000, windowDurationMins: 300 } } }) };
+    return { ...(this.accountId === undefined ? {} : { accountId: this.accountId }), ...(this.quota ?? { rateLimits: { primary: { usedPercent: 24, resetsAt: 1000, windowDurationMins: 300 } } }) };
   }
 }
 
@@ -62,7 +62,9 @@ test('account change during a read discards the response and clears old snapshot
     adapter.onRate = null; adapter.accountId = 'account-b'; await service.refresh();
     assert.equal(service.snapshot.status, 'ready');
     adapter.accountId = null; await service.refresh();
-    assert.equal(service.snapshot.errorCode, 'identity_unknown'); assert.equal(service.snapshot.buckets.length, 0);
+    assert.equal(service.snapshot.status, 'ready'); assert.equal(service.snapshot.errorCode, null);
+    assert.equal(service.snapshot.buckets[0].windows[0].remainingPercent, 76);
+    assert.equal(service.sourceAccountId, null); assert.equal(service.snapshot.tokens.account, null);
   } finally { await service.close(); }
 });
 test('auth notification invalidates in-flight results; sign-out and unsupported auth hide previous numbers', async () => {
@@ -254,6 +256,107 @@ const setCycle = (adapter: FakeAdapter, end: number) => {
   adapter.quota = { rateLimits: { limitId: 'codex', primary: { usedPercent: 24, windowDurationMins: 300, resetsAt: end / 1000 } } };
 };
 const fakePeriod = (total: number, window: TokenWindow): WindowTokens => ({ ...fakeAccount(total), window: { ...window }, excludedReviewTokens: 0 });
+
+test('verified quota works without a supplied account ID while local ownership remains unavailable', async () => {
+  for (const accountId of [undefined, null, '', '   ']) {
+    for (const tokenFailure of [false, true]) {
+      const adapter = new FakeAdapter(); adapter.accountId = accountId; adapter.tokenFailure = tokenFailure;
+      setCycle(adapter, periodNow + 2 * 60 * 60_000);
+      let localReads = 0, accountReads = 0;
+      const service = new UsageService({ adapter, trackingId: trackedA, now: () => periodNow,
+        localReader: { async read() { localReads++; return { chat: fakeChat(999), errorCode: null }; } },
+        accountReader: { async read(_account, window) {
+          accountReads++;
+          return { account: fakeAccount(999), errorCode: null, period: window ? fakePeriod(999, window) : null, periodErrorCode: null };
+        } },
+      });
+      try {
+        const snapshot = await service.refresh();
+        assert.equal(snapshot.status, 'ready'); assert.equal(snapshot.errorCode, null);
+        assert.equal(snapshot.buckets[0].windows[0].remainingPercent, 76);
+        assert.equal(service.sourceAccountId, null); assert.equal(service.failures, 0);
+        assert.equal(snapshot.tokens.chat, null); assert.equal(snapshot.tokens.account, null); assert.equal(snapshot.tokens.period, null);
+        assert.equal(snapshot.tokens.chatErrorCode, 'log_identity_mismatch');
+        assert.equal(snapshot.tokens.accountErrorCode, 'log_identity_mismatch');
+        assert.equal(snapshot.tokens.periodErrorCode, 'log_identity_mismatch');
+        assert.equal(snapshot.tokens.lifetimeTokens, tokenFailure ? null : 100);
+        assert.equal(snapshot.tokens.errorCode, tokenFailure ? 'timeout' : null);
+        assert.equal(nativePayload(snapshot, periodNow).standardUsd, null);
+        await service.refreshLocalTokens();
+        assert.equal(localReads, 0); assert.equal(accountReads, 0);
+      } finally { await service.close(); }
+    }
+  }
+});
+
+test('losing an account ID clears local counters and rejects delayed reads, then restores exact-account aggregation', async () => {
+  const adapter = new FakeAdapter(); setCycle(adapter, periodNow + 2 * 60 * 60_000);
+  let total = 40, gate: Promise<void> | null = null, release = () => {};
+  const accounts: string[] = [], published: Array<Array<number | null>> = [];
+  let localReads = 0;
+  const service = new UsageService({ adapter, trackingId: trackedA, now: () => periodNow,
+    localReader: { async read() {
+      localReads++; const chat = fakeChat(total);
+      if (gate) await gate;
+      return { chat, errorCode: null };
+    } },
+    accountReader: { async read(accountId, window) {
+      accounts.push(accountId); const account = fakeAccount(total), period = window ? fakePeriod(total, window) : null;
+      if (gate) await gate;
+      return { account, errorCode: null, period, periodErrorCode: null };
+    } },
+  });
+  service.on('snapshot', snapshot => published.push([snapshot.tokens.chat?.totalTokens ?? null,
+    snapshot.tokens.account?.totalTokens ?? null, snapshot.tokens.period?.totalTokens ?? null]));
+  try {
+    await service.refresh();
+    assert.equal(service.snapshot.tokens.chat?.totalTokens, 40);
+    assert.equal(service.snapshot.tokens.account?.totalTokens, 40);
+    assert.equal(service.snapshot.tokens.period?.totalTokens, 40);
+    const generation = service.tokenGeneration;
+    gate = new Promise<void>(resolve => release = resolve); total = 900;
+    const oldRead = service.refreshLocalTokens(); await new Promise(resolve => setImmediate(resolve));
+    adapter.accountId = undefined;
+    const missing = await service.refresh();
+    assert.equal(missing.status, 'ready'); assert.equal(missing.errorCode, null);
+    assert.equal(service.sourceAccountId, null); assert.ok(service.tokenGeneration > generation);
+    assert.equal(missing.tokens.chat, null); assert.equal(missing.tokens.account, null); assert.equal(missing.tokens.period, null);
+    assert.equal(missing.tokens.periodErrorCode, 'log_identity_mismatch');
+    release(); gate = null; await oldRead;
+    assert.equal(service.snapshot.tokens.chat, null); assert.equal(service.snapshot.tokens.account, null); assert.equal(service.snapshot.tokens.period, null);
+    assert.equal(published.some(values => values.includes(900)), false);
+    const reads = [localReads, accounts.length];
+    await service.refresh(); await service.refreshLocalTokens();
+    assert.deepEqual([localReads, accounts.length], reads);
+    adapter.accountId = 'account-b'; total = 20;
+    await service.refresh();
+    assert.equal(service.sourceAccountId, 'account-b'); assert.equal(service.snapshot.status, 'ready');
+    assert.equal(service.snapshot.tokens.chat?.totalTokens, 20);
+    assert.equal(service.snapshot.tokens.account?.totalTokens, 20);
+    assert.equal(service.snapshot.tokens.period?.totalTokens, 20);
+    assert.equal(service.snapshot.tokens.chatErrorCode, null); assert.equal(service.snapshot.tokens.accountErrorCode, null);
+    assert.equal(service.snapshot.tokens.periodErrorCode, null);
+    assert.deepEqual(accounts, ['account-a', 'account-a', 'account-b']);
+  } finally { release(); gate = null; await service.close(); }
+});
+
+test('an account change during a quota read without an account ID still discards unverified data', async () => {
+  const adapter = new FakeAdapter(); adapter.accountId = undefined;
+  setCycle(adapter, periodNow + 2 * 60 * 60_000);
+  const service = new UsageService({ adapter, accountReader: emptyAccountReader, now: () => periodNow });
+  try {
+    await service.refresh(); assert.equal(service.snapshot.status, 'ready');
+    adapter.onRate = () => { adapter.email = 'other@example.com'; };
+    await service.refresh();
+    assert.equal(service.snapshot.status, 'checking'); assert.equal(service.snapshot.buckets.length, 0);
+    assert.equal(service.snapshot.tokens.lifetimeTokens, null); assert.equal(service.snapshot.tokens.period, null);
+    adapter.onRate = null; await service.refresh();
+    assert.equal(service.snapshot.status, 'ready'); assert.equal(service.snapshot.errorCode, null);
+    adapter.email = null; await service.refresh();
+    assert.equal(service.snapshot.errorCode, 'identity_unknown'); assert.equal(service.snapshot.buckets.length, 0);
+  } finally { await service.close(); }
+});
+
 test('native currency and local polling use only current-cycle tokens, never account or lifetime totals', async () => {
   const adapter = new FakeAdapter(); let now = periodNow, total = 100;
   setCycle(adapter, now + 2 * 60 * 60_000);

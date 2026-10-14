@@ -7,8 +7,8 @@ import { emptyTokens, normalizeAccountTokens, type ChatTokens } from './tokens.t
 
 function authKey(response: any): string | null {
   const account = response?.account;
-  // The installed schema has no stable ID on account/read; only use the email in
-  // memory to detect auth changes. Usage accountId is also required below.
+  // account/read has no stable ID. Use the email only in memory to verify quota
+  // reads; local session ownership additionally requires an explicit accountId.
   return account?.type === 'chatgpt' && typeof account.email === 'string' && account.email.trim()
     ? createHash('sha256').update(account.email.trim().toLowerCase()).digest('hex') : null;
 }
@@ -206,21 +206,28 @@ export class UsageService extends EventEmitter {
         if (generation !== this.generation) return this.getSnapshot();
         if (authKey(after) !== key) { this.invalidate(); return this.getSnapshot(); }
         verified = true;
-        if (typeof raw.accountId !== 'string' || !raw.accountId.trim()) throw new AdapterError('identity_unknown');
-        const identity = createHash('sha256').update(`${key}:${raw.accountId}`).digest('hex');
+        // accountId is optional in App Server responses, including VS Code's
+        // bundled CLI. Quota reads are verified above, but local token records
+        // cannot be attributed safely without the backend's explicit ID.
+        const accountId = typeof raw.accountId === 'string' && raw.accountId.trim() ? raw.accountId : null;
+        const identity = createHash('sha256').update(JSON.stringify([key, accountId])).digest('hex');
         if (identity !== this.identity) {
           this.clearSnapshot('checking'); this.publish();
         }
         const previousTokens = this.snapshot.tokens;
         const previousWindow = tokenWindow(this.snapshot, this.now());
-        this.identity = identity; this.accountKey = key; this.sourceAccountId = raw.accountId;
+        this.identity = identity; this.accountKey = key; this.sourceAccountId = accountId;
         this.snapshot = normalizeUsage(raw, after.account.planType, this.now());
         this.snapshot.tokens = { ...previousTokens, ...(accountTokens ?? { errorCode: tokenError }), trackingId: this.trackingId };
         if (!sameTokenWindow(previousWindow, tokenWindow(this.snapshot, this.now()))) {
           this.tokenGeneration++;
           this.snapshot.tokens.period = null; this.snapshot.tokens.periodErrorCode = 'window_unavailable';
         }
-        await this.refreshLocalTokens();
+        if (accountId === null) {
+          this.snapshot.tokens = { ...this.snapshot.tokens, chat: null, account: null, period: null,
+            chatErrorCode: this.trackingId === null ? 'no_tracked_thread' : 'log_identity_mismatch',
+            accountErrorCode: 'log_identity_mismatch', periodErrorCode: 'log_identity_mismatch' };
+        } else await this.refreshLocalTokens();
         if (generation !== this.generation) return this.getSnapshot();
       }
       this.failures = 0;

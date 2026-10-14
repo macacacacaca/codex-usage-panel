@@ -29,6 +29,12 @@ npm run demo  # Clearly labeled demo mode; does not start Codex App Server
 
 Tests cover normalization, account isolation, token calculations, process cleanup, HTTP boundaries, private file permissions, native data endpoints, and CLI startup with a restricted Finder-style PATH. Native model checks cover bundled runtime discovery and executable search paths. Run the checks for the commit being released; prior release results do not establish validation for a new build.
 
+## VS Code Compatibility
+
+The official VS Code extension bundles its own Codex executable, which may be absent from the shell PATH. After checking the existing app and CLI locations, the adapter searches the Stable and Insiders extension directories for `openai.chatgpt-*`, selecting the newest usable executable for the host platform and architecture. `CODEX_BINARY` remains an explicit override.
+
+The bundled CLI **0.162.0-alpha.17.2** schema makes `account/rateLimits/read.accountId` optional and nullable. Before/after `account/read` email verification is sufficient to display quota data, but local records still require an explicit owner ID. Missing IDs clear local counters and invalidate pending local reads; restored IDs resume verified aggregation. Regression tests cover absent/null/blank IDs, account changes, delayed-reader isolation, and discovery without a shell PATH. These changes are in source and require rebuilding the app; existing v0.3.6 release ZIPs remain unchanged.
+
 ## Current Quota Period
 
 Version 0.3.6 measures consumption in the currently signed-in account's active Codex 300-minute quota window. Select the canonical `codex` category when present; a legacy Codex response with no limit ID is normalized to `codex`, while explicitly unrelated categories cannot supply the window. Define `startMs = resetsAtMs − 300 × 60,000` and `endMs = resetsAtMs`; require `0 ≤ startMs ≤ now < endMs`, a finite reset, and a duration of exactly 300 minutes.

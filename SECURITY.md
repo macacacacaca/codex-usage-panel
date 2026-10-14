@@ -19,6 +19,7 @@ GitHub Actions 每次 push／pull request 會執行敏感資訊掃描、建置�
 
 - Codex App Server adapter 只允許初始化與帳號／用量讀取操作，不建立模型對話、不管理憑證。
 - 面板不讀取或複製登入憑證檔；帳號 email 與 ID 僅用於記憶體內的身份核對，不送到前端或日誌。
+- 額度讀取前後透過 `account/read` 核對登入身份。來源未提供選填的 `accountId` 時，仍可顯示已核對的額度與重置時間，但會清除本機 Token 與美元估算、停止本機紀錄讀取，並丟棄先前進行中的本機讀取結果；不從 email 或紀錄推測帳號 ID。
 - 0.3.6 的 Token 與美元估算只涵蓋目前官方 300 分鐘額度區間內、這台 Mac 上已驗證帳號的請求增量。區間起點為重置時間減去 300 分鐘，終點為重置時間；不是滾動最近五小時或帳號歷史總量，也不從額度百分比推算 Token 或金額。
 - OpenAI [官方說明](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan)指出，ChatGPT 登入的 auto-review 安全檢查免費且不計入方案額度。本工具將精確模型 ID `codex-auto-review` 的當期請求排除於 Token 與美元估算，在明細另外顯示已排除的安全檢查 Token；其餘支援模型仍依官方 API 單價計算，不替未知模型指定別名或參考價格。
 - 讀取 `sessions/` 與 `archived_sessions/` JSONL 時，僅保留身份、時間戳記、模型與 Token 計數。`creator_account_id` 缺少或不符合已確認帳號時，該紀錄不納入；一般訊息不傳給面板或其他服務。Token 數值不另存檔。

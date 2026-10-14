@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
-import { accessSync, constants, statSync } from 'node:fs';
+import { accessSync, constants, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,8 +15,40 @@ function isExecutableFile(path: string): boolean {
   catch { return false; }
 }
 
-export function findCodex({ home = homedir(), environment = process.env, isExecutable = isExecutableFile }:
-  { home?: string; environment?: NodeJS.ProcessEnv; isExecutable?: (path: string) => boolean } = {}): string {
+function findVSCodeCodex(home: string, platform: NodeJS.Platform, arch: string, isExecutable: (path: string) => boolean): string | undefined {
+  // These are the platform directory names used by the official Codex extension.
+  const platformName = platform === 'darwin' ? 'macos' : platform === 'linux' ? 'linux' : platform === 'win32' ? 'windows' : undefined;
+  const architectureName = arch === 'arm64' ? 'aarch64' : arch === 'x64' ? 'x86_64' : undefined;
+  if (!platformName || !architectureName) return;
+  const candidates: { path: string; version: number[]; source: number; name: string }[] = [];
+  for (const [source, root] of ['.vscode', '.vscode-insiders'].entries()) {
+    const extensions = join(home, root, 'extensions');
+    let entries;
+    try { entries = readdirSync(extensions, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const match = /^openai\.chatgpt-(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(entry.name);
+      if (!match) continue;
+      const target = /(?:^|-)(darwin|linux|win32)-(arm64|x64|ia32|armhf)$/.exec(match[4] ?? '');
+      if (target && (target[1] !== platform || target[2] !== arch)) continue;
+      candidates.push({
+        path: join(extensions, entry.name, 'bin', `${platformName}-${architectureName}`, platform === 'win32' ? 'codex.exe' : 'codex'),
+        version: match.slice(1, 4).map(Number), source, name: entry.name,
+      });
+    }
+  }
+  candidates.sort((a, b) => {
+    for (let index = 0; index < 3; index++) {
+      if (a.version[index] !== b.version[index]) return b.version[index] - a.version[index];
+    }
+    return a.source - b.source || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  });
+  return candidates.find(candidate => isExecutable(candidate.path))?.path;
+}
+
+export function findCodex({ home = homedir(), environment = process.env, isExecutable = isExecutableFile, platform = process.platform, arch = process.arch }:
+  { home?: string; environment?: NodeJS.ProcessEnv; isExecutable?: (path: string) => boolean; platform?: NodeJS.Platform; arch?: string } = {}): string {
   if (environment.CODEX_BINARY) return environment.CODEX_BINARY;
   for (const path of [
     '/Applications/Codex.app/Contents/Resources/codex',
@@ -28,7 +60,7 @@ export function findCodex({ home = homedir(), environment = process.env, isExecu
     join(home, '.npm-global/bin/codex'),
     join(home, '.local/bin/codex'),
   ]) if (isExecutable(path)) return path;
-  return 'codex';
+  return findVSCodeCodex(home, platform, arch, isExecutable) ?? 'codex';
 }
 
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
