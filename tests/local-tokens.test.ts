@@ -291,6 +291,192 @@ test('window aggregation deduplicates a current fork and excludes inherited or a
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+const threadSettings = (threadId: unknown, model?: string) => ({
+  type: 'event_msg', timestamp: new Date(windowStart + 120_000).toISOString(),
+  payload: { type: 'thread_settings_applied', thread_id: threadId, thread_settings: model === undefined ? {} : { model } },
+});
+const legacyForkPrefix = () =>
+  line({ type: 'session_meta', payload: { id: secondId, creator_account_id: 'account-a', forked_from_id: id } }) +
+  line({ ...meta, payload: { ...meta.payload, creator_account_id: 'account-b' } }) + line(context('gpt-6-astra')) +
+  line(timedEvent(windowStart + 30_000, count(1000, 200, 100))) + line(threadSettings(id, 'gpt-6-astra')) +
+  line(timedEvent(windowStart + 60_000, count(1100, 220, 100), count(100, 20)));
+const firstLegacyChildRequest = () => line(timedEvent(windowStart + 180_000, count(1150, 230, 120), count(50, 10, 20)));
+
+test('legacy fork ownership markers exclude current-window copied parent tokens and price only the child request', async () => {
+  const f = await accountFixture();
+  try {
+    const log = legacyForkPrefix() + line(threadSettings(secondId.toUpperCase(), 'gpt-6-luna')) + firstLegacyChildRequest();
+    await writeFile(join(f.active, `rollout-legacy-${secondId}.jsonl`), log);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.errorCode, null); assert.equal(result.periodErrorCode, null);
+    for (const snapshot of [result.account, result.period]) {
+      assert.equal(snapshot?.totalTokens, 60); assert.equal(snapshot?.inputTokens, 50);
+      assert.equal(snapshot?.outputTokens, 10); assert.equal(snapshot?.cachedInputTokens, 20);
+      assert.equal(snapshot?.sessionCount, 1); assert.equal(snapshot?.complete, true);
+      assert.deepEqual(snapshot?.segments.map(segment => segment.model), ['gpt-6-luna']);
+      assert.ok(Math.abs(estimateUsd(snapshot)! - 0.0000082) < 1e-15);
+    }
+    assert.equal((await f.reader.read('account-b', currentWindow, observedNow)).account, null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('legacy forks without a valid canonical ownership marker remain ambiguous', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-legacy-unowned-${secondId}.jsonl`);
+    const markers = ['', line(threadSettings(otherId, 'gpt-6-luna')), line(threadSettings(null, 'gpt-6-luna')),
+      line(threadSettings(`${secondId}/invalid`, 'gpt-6-luna')),
+      line({ ...threadSettings(secondId, 'gpt-6-luna'), type: 'response_item' })];
+    for (const marker of markers) {
+      await writeFile(path, legacyForkPrefix() + marker + line(context('gpt-6-luna')) + firstLegacyChildRequest());
+      const result = await f.reader.read('account-a', currentWindow, observedNow);
+      assert.equal(result.account, null); assert.equal(result.errorCode, 'account_logs_incomplete');
+      assert.equal(result.period?.totalTokens, 0); assert.equal(result.period?.complete, false);
+      assert.equal(result.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(result.period), null);
+    }
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('appended canonical markers resolve a legacy fork incrementally while retaining its inherited counter baseline', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-legacy-incremental-${secondId}.jsonl`);
+    await writeFile(path, legacyForkPrefix());
+    const ambiguous = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(ambiguous.account, null); assert.equal(ambiguous.period?.totalTokens, 0);
+    assert.equal(ambiguous.period?.complete, false); assert.equal(estimateUsd(ambiguous.period), null);
+    const marker = line(threadSettings(secondId, 'gpt-6-luna'));
+    await appendFile(path, marker.slice(0, -2));
+    assert.equal((await f.reader.read('account-a', currentWindow, observedNow)).period?.complete, false);
+    await appendFile(path, marker.slice(-2) + firstLegacyChildRequest());
+    const recovered = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(recovered.account?.totalTokens, 60); assert.equal(recovered.account?.complete, true);
+    assert.equal(recovered.period?.totalTokens, 60); assert.equal(recovered.period?.complete, true);
+    assert.equal(recovered.errorCode, null); assert.equal(recovered.periodErrorCode, null);
+    assert.ok(Math.abs(estimateUsd(recovered.period)! - 0.0000082) < 1e-15);
+    await appendFile(path, line(timedEvent(windowStart + 240_000, count(1200, 240, 140), count(50, 10, 20))));
+    const next = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(next.account?.totalTokens, 120); assert.equal(next.period?.totalTokens, 120);
+    assert.equal(next.period?.complete, true); assert.ok(Math.abs(estimateUsd(next.period)! - 0.0000164) < 1e-15);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('later same-owner markers cannot clear a real child request gap after a legacy fork boundary', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-legacy-gap-${secondId}.jsonl`);
+    await writeFile(path, legacyForkPrefix() + line(threadSettings(secondId, 'gpt-6-luna')) + firstLegacyChildRequest() +
+      line(timedEvent(windowStart + 240_000, count(1300, 260, 120), count(50, 10))));
+    const gap = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(gap.account?.complete, false); assert.equal(gap.period?.totalTokens, 60);
+    assert.equal(gap.period?.complete, false); assert.equal(estimateUsd(gap.period), null);
+    await appendFile(path, line(threadSettings(secondId, 'gpt-6-luna')) +
+      line(timedEvent(windowStart + 300_000, count(1350, 270, 120), count(50, 10))));
+    const later = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(later.account?.totalTokens, 300); assert.equal(later.account?.complete, false);
+    assert.equal(later.period?.totalTokens, 120); assert.equal(later.period?.complete, false);
+    assert.equal(later.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(later.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('ownership markers cannot revive a fork with an explicitly bounded ambiguous first request', async () => {
+  const f = await accountFixture();
+  try {
+    const log = line({ type: 'session_meta', payload: { id: secondId, creator_account_id: 'account-a', forked_from_id: id, subagent_history_start_ordinal: 4 } }) +
+      line(meta) + line(context()) + line(timedEvent(windowStart, count(100, 20))) + line(context()) +
+      line(timedEvent(windowStart + 60_000, count(300, 60), count(50, 10))) +
+      line(threadSettings(secondId, 'gpt-6-luna')) + line(timedEvent(windowStart + 180_000, count(350, 70), count(50, 10)));
+    await writeFile(join(f.active, `rollout-bounded-ambiguous-${secondId}.jsonl`), log);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.account, null); assert.equal(result.errorCode, 'account_logs_incomplete');
+    assert.equal(result.period?.totalTokens, 0); assert.equal(result.period?.complete, false);
+    assert.equal(result.periodErrorCode, 'period_logs_incomplete'); assert.equal(estimateUsd(result.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('legacy ownership markers clear copied model attribution and accept a later own turn context', async () => {
+  const f = await accountFixture();
+  try {
+    const path = join(f.active, `rollout-legacy-model-${secondId}.jsonl`);
+    for (const model of [undefined, '']) {
+      await writeFile(path, legacyForkPrefix() + line(threadSettings(secondId, model)) + firstLegacyChildRequest());
+      const unknown = await f.reader.read('account-a', currentWindow, observedNow);
+      assert.equal(unknown.period?.totalTokens, 60); assert.equal(unknown.period?.complete, false);
+      assert.deepEqual(unknown.period?.segments.map(segment => segment.model), [null]);
+      assert.equal(estimateUsd(unknown.period), null);
+    }
+    await writeFile(path, legacyForkPrefix() + line(threadSettings(secondId)) + line(context('gpt-6-luna')) + firstLegacyChildRequest());
+    const ownModel = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(ownModel.period?.totalTokens, 60); assert.equal(ownModel.period?.complete, true);
+    assert.deepEqual(ownModel.period?.segments.map(segment => segment.model), ['gpt-6-luna']);
+    assert.ok(Math.abs(estimateUsd(ownModel.period)! - 0.0000082) < 1e-15);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a malformed legacy ownership marker cannot be replaced by a later resume marker after own usage', () => {
+  const state = new TokenLogState(windowStart);
+  legacyForkPrefix().split('\n').filter(Boolean).forEach(row => state.accept(row));
+  state.accept(line(threadSettings(secondId, 'gpt-6-luna')).slice(0, -3) + '\n');
+  state.accept(line(context('gpt-6-luna')));
+  state.accept(firstLegacyChildRequest());
+  state.accept(line(threadSettings(secondId, 'gpt-6-luna')));
+  state.accept(line(timedEvent(windowStart + 240_000, count(1200, 240, 140), count(50, 10, 20))));
+  const period = state.periodSnapshot(currentWindow, observedNow);
+  assert.equal(state.complete, false); assert.equal(state.forkAmbiguous, true);
+  assert.equal(period?.complete, false); assert.equal(estimateUsd(period), null);
+});
+
+test('an unclassified skipped legacy prefix record blocks later resume-marker recovery after own usage', () => {
+  for (const clearModel of [false, true]) {
+    const state = new TokenLogState(windowStart);
+    legacyForkPrefix().split('\n').filter(Boolean).forEach(row => state.accept(row));
+    state.skipRecord(false, clearModel);
+    state.accept(line(context('gpt-6-luna')));
+    state.accept(firstLegacyChildRequest());
+    state.accept(line(threadSettings(secondId, 'gpt-6-luna')));
+    state.accept(line(timedEvent(windowStart + 240_000, count(1200, 240, 140), count(50, 10, 20))));
+    const period = state.periodSnapshot(currentWindow, observedNow);
+    assert.equal(state.complete, false); assert.equal(state.forkAmbiguous, true);
+    assert.equal(period?.complete, false); assert.equal(estimateUsd(period), null);
+  }
+});
+
+test('malformed missing-discriminator and unknown legacy prefix rows block later resume-marker recovery', () => {
+  const rows = [
+    '{"type":"event_msg","payload":{"ty\n',
+    line({ type: 'unknown_rollout_type', payload: {} }),
+    line({ type: 'unknown_rollout_type', payload: { type: 'thread_settings_applied', thread_id: secondId } }),
+  ];
+  for (const row of rows) {
+    const state = new TokenLogState(windowStart);
+    legacyForkPrefix().split('\n').filter(Boolean).forEach(prefix => state.accept(prefix));
+    state.accept(row);
+    state.accept(line(context('gpt-6-luna')));
+    state.accept(firstLegacyChildRequest());
+    state.accept(line(threadSettings(secondId, 'gpt-6-luna')));
+    state.accept(line(timedEvent(windowStart + 240_000, count(1200, 240, 140), count(50, 10, 20))));
+    const period = state.periodSnapshot(currentWindow, observedNow);
+    assert.equal(state.complete, false); assert.equal(state.forkAmbiguous, true);
+    assert.equal(period?.complete, false); assert.equal(estimateUsd(period), null);
+  }
+});
+
+test('valid official legacy prefix rows and ordinary nested discriminators still permit recovery', () => {
+  const state = new TokenLogState(windowStart);
+  legacyForkPrefix().split('\n').filter(Boolean).forEach(row => state.accept(row));
+  state.accept(line({ type: 'response_item', payload: { content: 'ordinary content' } }));
+  state.accept(line({ type: 'response_item', payload: { type: 'thread_settings_applied', thread_id: secondId, nested: { type: 'token_count' } } }));
+  for (const type of ['world_state', 'inter_agent_communication_metadata', 'token_usage_record']) {
+    state.accept(line({ type, payload: { dummy: true } }));
+  }
+  state.accept(line(threadSettings(secondId, 'gpt-6-luna')));
+  state.accept(firstLegacyChildRequest());
+  const period = state.periodSnapshot(currentWindow, observedNow);
+  assert.equal(state.snapshot()?.totalTokens, 60); assert.equal(state.complete, true); assert.equal(state.forkAmbiguous, false);
+  assert.equal(period?.totalTokens, 60); assert.equal(period?.complete, true);
+  assert.ok(Math.abs(estimateUsd(period)! - 0.0000082) < 1e-15);
+});
+
 test('an unreadable rollout withholds price for a partial current window', { skip: process.getuid?.() === 0 }, async () => {
   const f = await accountFixture();
   const blocked = join(f.active, `rollout-unreadable-${secondId}.jsonl`);
@@ -502,5 +688,18 @@ test('skipping an oversized ordinary inherited record preserves the child fork o
     const result = await f.reader.read('account-a', currentWindow, observedNow);
     assert.equal(result.period?.totalTokens, 60); assert.equal(result.period?.complete, true);
     assert.notEqual(estimateUsd(result.period), null);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('an oversized known ordinary inherited record still permits legacy ownership-marker recovery', async () => {
+  const f = await accountFixture();
+  try {
+    const log = legacyForkPrefix() + line({ type: 'response_item', payload: { content: largeDummyText } }) +
+      line(threadSettings(secondId, 'gpt-6-luna')) + firstLegacyChildRequest();
+    await writeFile(join(f.active, `rollout-legacy-ordinary-large-${secondId}.jsonl`), log);
+    const result = await f.reader.read('account-a', currentWindow, observedNow);
+    assert.equal(result.account?.totalTokens, 60); assert.equal(result.account?.complete, true);
+    assert.equal(result.period?.totalTokens, 60); assert.equal(result.period?.complete, true);
+    assert.equal(result.periodErrorCode, null); assert.ok(Math.abs(estimateUsd(result.period)! - 0.0000082) < 1e-15);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });

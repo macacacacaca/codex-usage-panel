@@ -12,7 +12,7 @@ const ZERO: Counters = { inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTo
 const FIELDS = Object.keys(ZERO) as Array<keyof Counters>;
 type PeriodEntry = { atMs: number; segment: TokenSegment; sourceTotal: Counters; complete: boolean };
 type PeriodSnapshot = ChatTokens & { excludedReviewTokens: number };
-type PeriodUncertainty = { fromMs: number | null; toMs: number | null };
+type PeriodUncertainty = { fromMs: number | null; toMs: number | null; inheritedPrefix?: boolean };
 type AccountReadResult = { account: AccountTokens | null; errorCode: string | null; period: WindowTokens | null; periodErrorCode: string | null };
 const MAX_PERIOD_ENTRIES = 20_000;
 const MAX_PERIOD_UNCERTAINTIES = 256;
@@ -140,11 +140,17 @@ class OversizedRecordHeader {
     if (byte === 45 || (byte >= 48 && byte <= 57)) { this.mode = 'number'; this.numeric = byte === 45 ? 'minus' : byte === 48 ? 'zero' : 'integer'; return; }
     this.invalid = true;
   }
-  finish(): { unrelated: boolean; clearModel: boolean } {
+  finish(): { unrelated: boolean; clearModel: boolean; boundaryExcluded: boolean } {
     const valid = !this.invalid && !this.frames.length && this.root === 'done' && (this.mode === null || (this.mode === 'number' && this.finishNumber())) && this.typeKeys === 1 && this.payloadKeys <= 1 && this.eventTypeKeys <= 1;
     const ordinaryEvent = this.topType === 'event_msg' && ['user_message', 'agent_message', 'agent_reasoning', 'agent_reasoning_raw_content', 'item_completed', 'task_started', 'task_complete', 'turn_aborted'].includes(this.eventType ?? '');
     const unrelated = valid && (this.topType === 'response_item' || this.topType === 'compacted' || ordinaryEvent);
-    return { unrelated, clearModel: !valid || this.topType === 'turn_context' || !['session_meta', 'event_msg', 'response_item', 'compacted'].includes(this.topType ?? '') };
+    // Official RolloutItem variants have distinct root tags; their nested
+    // values cannot replace an event_msg thread-settings ownership marker.
+    const boundaryExcluded = valid && (['session_meta', 'turn_context', 'response_item', 'compacted', 'world_state',
+      'inter_agent_communication', 'inter_agent_communication_metadata', 'token_usage_record', 'retained_context',
+      'security_risk_score', 'realtime_item'].includes(this.topType ?? '') ||
+      this.topType === 'event_msg' && this.eventType !== null && this.eventType !== 'thread_settings_applied');
+    return { unrelated, boundaryExcluded, clearModel: !valid || this.topType === 'turn_context' || !['session_meta', 'event_msg', 'response_item', 'compacted'].includes(this.topType ?? '') };
   }
 }
 
@@ -201,6 +207,9 @@ export class TokenLogState {
   private ordinal = 0;
   private ownStartOrdinal: number | null = null;
   private forked = false;
+  private awaitingLegacyForkBoundary = false;
+  private legacyForkBoundaryUnsafe = false;
+  private completeBeforeInheritedPrefix = true;
   private rawTotal: Counters | null = null;
   private inheritedTotal: Counters = { ...ZERO };
   private rawAtMs: number | null = null;
@@ -219,13 +228,14 @@ export class TokenLogState {
   private uncertain(fromMs: number | null, toMs: number | null): void {
     if (fromMs !== null && toMs !== null && fromMs > toMs) { fromMs = null; toMs = null; }
     if (this.periodRetainFromMs === Infinity || (toMs !== null && toMs < this.periodRetainFromMs)) return;
-    const gap = { fromMs, toMs }; this.periodUncertainties.push(gap);
+    const gap: PeriodUncertainty = { fromMs, toMs, inheritedPrefix: this.awaitingLegacyForkBoundary }; this.periodUncertainties.push(gap);
     if (toMs === null) this.pendingUncertainties.push(gap);
     if (this.periodUncertainties.length > MAX_PERIOD_UNCERTAINTIES) {
       // Exhausted evidence is explicitly incomplete instead of silently dropped.
       const bounded = {
         fromMs: this.periodUncertainties.some(item => item.fromMs === null) ? null : Math.min(...this.periodUncertainties.map(item => item.fromMs!)),
         toMs: this.periodUncertainties.some(item => item.toMs === null) ? null : Math.max(...this.periodUncertainties.map(item => item.toMs!)),
+        inheritedPrefix: this.periodUncertainties.every(item => item.inheritedPrefix),
       };
       this.periodUncertainties = [bounded]; this.pendingUncertainties = bounded.toMs === null ? [bounded] : [];
     }
@@ -268,14 +278,33 @@ export class TokenLogState {
   skipRecord(unrelated = false, clearModel = true): void {
     this.ordinal++;
     if (unrelated) return;
+    // A skipped relevant record could hide the first child-owned marker. A
+    // later resume marker cannot safely reclassify the intervening requests.
+    if (this.awaitingLegacyForkBoundary) this.legacyForkBoundaryUnsafe = true;
     this.complete = false; if (clearModel) this.model = null;
     this.uncertain(this.rawAtMs, null);
   }
 
+  private validateLegacyPrefix(line: string): void {
+    if (!this.awaitingLegacyForkBoundary || !line.trim()) return;
+    // Ordinary prefix rows need no retained values, but malformed or unknown
+    // headers could conceal the child's initial settings marker.
+    const header = new OversizedRecordHeader(); header.feed(Buffer.from(line));
+    if (!header.finish().boundaryExcluded) {
+      this.legacyForkBoundaryUnsafe = true; this.complete = false; this.uncertain(this.rawAtMs, null);
+    }
+  }
+
   accept(line: string): void {
     const ordinal = this.ordinal++;
-    if (!/"type"\s*:\s*"(token_count|turn_context|session_meta)"/.test(line)) return;
-    let row: any; try { row = JSON.parse(line); } catch { this.complete = false; this.uncertain(this.rawAtMs, null); return; }
+    if (!/"type"\s*:\s*"(token_count|turn_context|session_meta|thread_settings_applied)"/.test(line)) {
+      this.validateLegacyPrefix(line);
+      return;
+    }
+    let row: any; try { row = JSON.parse(line); } catch {
+      if (this.awaitingLegacyForkBoundary) this.legacyForkBoundaryUnsafe = true;
+      this.complete = false; this.uncertain(this.rawAtMs, null); return;
+    }
     if (row.type === 'session_meta') {
       // The first metadata belongs to this rollout. Copied fork history can
       // contain ancestors' metadata; it must never replace canonical ownership.
@@ -286,9 +315,27 @@ export class TokenLogState {
       this.ownStartOrdinal = counter(row.payload?.subagent_history_start_ordinal);
       this.forked = row.payload?.forked_from_id != null || row.payload?.history_base != null || (this.ownStartOrdinal ?? 0) > 0;
       this.forkAmbiguous = this.forked && this.ownStartOrdinal === null;
+      this.awaitingLegacyForkBoundary = this.forkAmbiguous && validThreadId(this.sessionId) && validThreadId(row.payload?.forked_from_id) &&
+        row.payload.forked_from_id.toLowerCase() !== this.sessionId.toLowerCase() &&
+        row.payload?.history_base == null && row.payload?.subagent_history_start_ordinal == null &&
+        (row.payload?.history_mode == null || row.payload.history_mode === 'legacy');
+      this.completeBeforeInheritedPrefix = this.complete;
       if (this.forkAmbiguous) this.complete = false;
     } else if (row.type === 'turn_context') {
       this.model = typeof row.payload?.model === 'string' ? row.payload.model.slice(0, 100) : null;
+    } else if (this.awaitingLegacyForkBoundary && row.type === 'event_msg' && row.payload?.type === 'thread_settings_applied') {
+      if (!validThreadId(row.payload.thread_id)) { this.legacyForkBoundaryUnsafe = true; return; }
+      if (this.legacyForkBoundaryUnsafe || !validThreadId(this.sessionId) ||
+        row.payload.thread_id.toLowerCase() !== this.sessionId.toLowerCase()) return;
+      // Copied legacy forks append their own settings after inherited history.
+      // Parent-owned settings cannot establish this boundary, and subsequent
+      // settings must never erase uncertainty from the child's real requests.
+      this.awaitingLegacyForkBoundary = false; this.forkAmbiguous = false;
+      this.ownStartOrdinal = ordinal + 1; this.complete = this.completeBeforeInheritedPrefix;
+      this.periodUncertainties = this.periodUncertainties.filter(gap => !gap.inheritedPrefix);
+      this.pendingUncertainties = this.pendingUncertainties.filter(gap => this.periodUncertainties.includes(gap));
+      const model = row.payload.thread_settings?.model;
+      this.model = typeof model === 'string' && model.trim() ? model.slice(0, 100) : null;
     } else if (row.type === 'event_msg' && row.payload?.type === 'token_count' && row.payload.info) {
       const info = row.payload.info;
       const parsedTime = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
@@ -297,6 +344,13 @@ export class TokenLogState {
       if (this.forked && ordinal < this.ownStartOrdinal!) {
         if (next) { this.rawTotal = next; this.inheritedTotal = next; this.rawAtMs = atMs; }
         return;
+      }
+      if (this.awaitingLegacyForkBoundary) {
+        const previousAtMs = this.rawAtMs;
+        if (next) { this.rawTotal = next; this.inheritedTotal = next; this.rawAtMs = atMs; }
+        // Keep unresolved prefixes incomplete until their ownership is proven.
+        // Their counters seed reconciliation, but are never counted as child use.
+        this.uncertain(atMs ?? previousAtMs, atMs); return;
       }
       this.observeTime(atMs);
       if (!next) { this.complete = false; this.uncertain(atMs ?? this.rawAtMs, atMs); return; }
@@ -366,7 +420,7 @@ export class TokenLogState {
       }
       this.rawAtMs = atMs;
       this.updatedAtMs = atMs ?? this.updatedAtMs;
-    }
+    } else this.validateLegacyPrefix(line);
   }
   snapshot(): ChatTokens | null {
     return this.total ? { ...this.total, segments: [...this.segments.values()].map(segment => ({ ...segment })), updatedAtMs: this.updatedAtMs, complete: this.complete } : null;

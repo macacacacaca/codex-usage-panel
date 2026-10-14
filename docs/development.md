@@ -41,6 +41,12 @@ Version 0.3.6 measures consumption in the currently signed-in account's active C
 
 Aggregate verified request deltas from `sessions/` and `archived_sessions/` when `startMs ≤ timestampMs < endMs` and `timestampMs ≤ now`. Counts, input/cache/output splits, and model pricing all use this interval. Lifetime counters and quota percentages cannot substitute for timestamped request consumption. Preserve account-owner checks, duplicate-session/event suppression, and fork-inheritance protections.
 
+### Copied Fork Boundaries
+
+Legacy copied forks can omit `subagent_history_start_ordinal`. Codex writes a `thread_settings_applied` event owned by the child thread after the inherited prefix. Source builds recognize that explicit marker as the boundary: inherited token rows seed cumulative counters but do not count toward the child; only subsequent reconciled request deltas contribute. Copied records can receive new timestamps, so timestamps cannot distinguish inherited usage.
+
+A missing, invalid, or foreign-thread marker leaves the fork unverified and USD unavailable. The marker resolves only an initially missing boundary; later settings events cannot clear real request gaps or ambiguity from an explicit numeric boundary. Regression tests cover copied current-period counters, incremental marker arrival, model changes, owner mismatches, and post-boundary counter gaps. Previously downloaded v0.3.6 release apps require rebuilding to include this fix.
+
 ### Excluded Safety Reviews
 
 OpenAI's ChatGPT sign-in policy makes auto-review safety checks free and exempt from plan limits. [Official policy](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan). The reader excludes only the exact model ID `codex-auto-review` from current-period counters and pricing segments, while recording its verified in-period token total as `excludedReviewTokens` for details. Account, timestamp, and interval checks determine that separate period total. Version 0.3.6 also prevents a verified, exact free-review delta with no timestamp from creating paid-pricing uncertainty; it is not added to `excludedReviewTokens` because its interval cannot be established. Raw cumulative counters remain the verification baseline. Period `.complete` describes paid-request coverage; actual paid or ambiguous deltas remain conservative.
