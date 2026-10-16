@@ -242,12 +242,17 @@ struct UsageView: View {
             case "window_expired": return "正在確認新的 5 小時區間…"
             case "no_token_events": return "目前帳號尚無可核對的本機紀錄"
             case "period_logs_incomplete": return "本次紀錄不完整 · 暫不估價"
+            case "reference_history_unavailable": return "部分聊天的來源紀錄無法核對"
             case "log_unavailable": return "暫時無法讀取本機 Token 紀錄"
             case "counter_overflow", "log_identity_mismatch": return "無法核對本次 Token 紀錄"
             default: return "正在取得本次 5 小時 Token"
             }
         }
-        if model.period?.complete == false { return "本次可核對 Token 小計 · 資料不完整 · 暫不估價" }
+        if model.period?.complete == false {
+            return model.snapshot?.tokens.periodErrorCode == "reference_history_unavailable"
+                ? "部分來源紀錄無法核對 · 暫不估價"
+                : "本次可核對 Token 小計 · 資料不完整 · 暫不估價"
+        }
         if let reason = model.usdUnavailableReason { return reason }
         return "本次本機 \(model.pricing == "fast" ? "Fast × 2" : "Standard") 等值 · 非帳單"
     }

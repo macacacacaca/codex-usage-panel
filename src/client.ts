@@ -115,8 +115,10 @@ function render() {
   $('token-usd').title = usd === null ? usdUnavailableReason ?? '缺少完整模型或 Token 拆分，暫不估價' : `US$${usd.toFixed(6)}（API 單價等值${excludedReviewTokens > 0 ? '；不含免費安全審核' : ''}）`;
   const tokenError = tokens.period && !period
     ? tokens.period.window.endAtMs <= Date.now() ? '正在確認新的 5 小時區間…' : '尚無有效的 5 小時額度區間'
-    : { window_unavailable: '尚無有效的 5 小時額度區間', window_expired: '正在確認新的 5 小時區間…', no_token_events: '目前帳號尚無可核對的本機紀錄', log_unavailable: '暫時無法讀取本機紀錄', period_logs_incomplete: '部分本次紀錄無法完整核對', counter_overflow: '無法核對本次 Token 總量', log_identity_mismatch: '無法確認本次紀錄的帳號' }[tokens.periodErrorCode ?? ''];
-  text('token-note', period ? !period.complete ? '本次可核對 Token 小計 · 資料不完整 · 暫不估價' : usdUnavailableReason ?? `本次本機 API ${settings.pricing === 'fast' ? 'Fast' : 'Standard'} 等值 · 非帳單${snapshot.status === 'offline' ? ' · 上次資料' : ''}` : tokenError ?? '正在取得本次 5 小時 Token');
+    : { window_unavailable: '尚無有效的 5 小時額度區間', window_expired: '正在確認新的 5 小時區間…', no_token_events: '目前帳號尚無可核對的本機紀錄', log_unavailable: '暫時無法讀取本機紀錄', period_logs_incomplete: '部分本次紀錄無法完整核對', reference_history_unavailable: '部分聊天的來源紀錄無法核對', counter_overflow: '無法核對本次 Token 總量', log_identity_mismatch: '無法確認本次紀錄的帳號' }[tokens.periodErrorCode ?? ''];
+  const incompleteNote = tokens.periodErrorCode === 'reference_history_unavailable'
+    ? '部分來源紀錄無法核對 · 暫不估價' : '本次可核對 Token 小計 · 資料不完整 · 暫不估價';
+  text('token-note', period ? !period.complete ? incompleteNote : usdUnavailableReason ?? `本次本機 API ${settings.pricing === 'fast' ? 'Fast' : 'Standard'} 等值 · 非帳單${snapshot.status === 'offline' ? ' · 上次資料' : ''}` : tokenError ?? '正在取得本次 5 小時 Token');
   const newDetailSignature = JSON.stringify([current, snapshot.resetCreditsAvailable, snapshot.status, tokens, period?.window ?? null, settings.pricing, settings.timeZone]);
   if (detailSignature !== newDetailSignature) {
     detailSignature = newDetailSignature;

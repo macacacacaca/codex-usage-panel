@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
 import { readdir, lstat, open, type FileHandle } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { counter, normalizeCounters, type AccountTokens, type ChatTokens, type Counters, type TokenSegment, type TokenWindow, type WindowTokens } from './tokens.ts';
 
@@ -17,8 +17,40 @@ type AccountReadResult = { account: AccountTokens | null; errorCode: string | nu
 const MAX_PERIOD_ENTRIES = 20_000;
 const MAX_PERIOD_UNCERTAINTIES = 256;
 const FREE_REVIEW_MODEL = 'codex-auto-review';
+const MAX_REFERENCE_DEPTH = 32;
+type HistoryReference = { thread_id: string; end_ordinal_exclusive: number; end_byte_offset: number };
+type ReferenceBaseline = { reference: HistoryReference; total: Counters; atMs: number | null; signature: string; canonicalId: string; physicalIds: string[] };
+type ReferenceResolver = (metadata: any) => Promise<ReferenceBaseline | null>;
 
-type JsonFrame = { kind: 'object' | 'array'; expect: 'keyOrEnd' | 'key' | 'colon' | 'valueOrEnd' | 'value' | 'commaOrEnd'; scope: 'root' | 'payload' | 'other'; key: 'type' | 'payload' | null };
+function historyReference(value: any): HistoryReference | null {
+  return value && validThreadId(value.thread_id) && Number.isSafeInteger(value.end_ordinal_exclusive) && value.end_ordinal_exclusive > 0 &&
+    Number.isSafeInteger(value.end_byte_offset) && value.end_byte_offset > 0
+    ? { thread_id: value.thread_id.toLowerCase(), end_ordinal_exclusive: value.end_ordinal_exclusive, end_byte_offset: value.end_byte_offset } : null;
+}
+function physicalRolloutId(path: string): string | null {
+  const match = basename(path).match(/(?:-|_)([\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12})\.jsonl$/i);
+  return match?.[1].toLowerCase() ?? null;
+}
+function canonicalRolloutId(path: string): string | null {
+  const uuid = '[\\da-f]{8}-[\\da-f]{4}-[\\da-f]{4}-[\\da-f]{4}-[\\da-f]{12}';
+  return basename(path).match(new RegExp(`-(${uuid})(?:_${uuid})?\\.jsonl$`, 'i'))?.[1].toLowerCase() ?? null;
+}
+function selectedMetadata(row: any) {
+  const value = row?.payload, base = value?.history_base;
+  return { type: 'session_meta', ordinal: typeof row?.ordinal === 'number' ? row.ordinal : null, payload: {
+    id: typeof value?.id === 'string' ? value.id : null,
+    creator_account_id: typeof value?.creator_account_id === 'string' ? value.creator_account_id : null,
+    history_mode: typeof value?.history_mode === 'string' ? value.history_mode : null,
+    history_base: base == null ? null : { thread_id: typeof base.thread_id === 'string' ? base.thread_id : null,
+      end_ordinal_exclusive: typeof base.end_ordinal_exclusive === 'number' ? base.end_ordinal_exclusive : null,
+      end_byte_offset: typeof base.end_byte_offset === 'number' ? base.end_byte_offset : null },
+    forked_from_id: value?.forked_from_id == null ? null : typeof value.forked_from_id === 'string' ? value.forked_from_id : false,
+    subagent_history_start_ordinal: value?.subagent_history_start_ordinal == null ? null :
+      typeof value.subagent_history_start_ordinal === 'number' ? value.subagent_history_start_ordinal : false,
+  } };
+}
+
+type JsonFrame = { kind: 'object' | 'array'; expect: 'keyOrEnd' | 'key' | 'colon' | 'valueOrEnd' | 'value' | 'commaOrEnd'; scope: 'root' | 'payload' | 'other'; key: 'type' | 'payload' | 'ordinal' | null };
 /** Scans oversized records structurally without retaining message values.
  * Discriminators must be in the first 8 KiB. A later duplicate discriminator
  * invalidates an early header instead of overriding it silently. */
@@ -41,6 +73,17 @@ class OversizedRecordHeader {
   private typeKeys = 0;
   private payloadKeys = 0;
   private eventTypeKeys = 0;
+  private ordinalKeys = 0;
+  private ordinalValue: number | null = null;
+  private ordinalNumber: string | null = null;
+  private readingOrdinal = false;
+  private finishOrdinal(): void {
+    if (this.readingOrdinal && this.ordinalNumber !== null) {
+      const value = Number(this.ordinalNumber);
+      if (Number.isSafeInteger(value) && value >= 0) this.ordinalValue = value;
+    }
+    this.readingOrdinal = false; this.ordinalNumber = null;
+  }
   feed(chunk: Buffer): void {
     // Search unretained string bodies in native code. This keeps large image
     // and tool-output strings from paying a JavaScript call per payload byte.
@@ -82,10 +125,11 @@ class OversizedRecordHeader {
       this.capture = null;
       const frame = this.frames.at(-1);
       if (this.stringRole === 'key' && frame) {
-        frame.key = value === 'type' || value === 'payload' ? value : null; frame.expect = 'colon';
+        frame.key = value === 'type' || value === 'payload' || value === 'ordinal' ? value : null; frame.expect = 'colon';
         if (frame.scope === 'root' && frame.key === 'type') this.typeKeys++;
         if (frame.scope === 'root' && frame.key === 'payload') this.payloadKeys++;
         if (frame.scope === 'payload' && frame.key === 'type') this.eventTypeKeys++;
+        if (frame.scope === 'root' && frame.key === 'ordinal') this.ordinalKeys++;
       } else if (this.stringRole === 'type' && this.bytes <= 8_192) {
         if (this.stringScope === 'root') this.topType = value;
         else if (this.stringScope === 'payload') this.eventType = value;
@@ -98,6 +142,9 @@ class OversizedRecordHeader {
       return;
     }
     if (this.mode === 'number') {
+      if (this.readingOrdinal && /[\d.eE+-]/.test(String.fromCharCode(byte))) {
+        this.ordinalNumber = this.ordinalNumber !== null && this.ordinalNumber.length < 32 ? this.ordinalNumber + String.fromCharCode(byte) : null;
+      }
       if (byte >= 48 && byte <= 57) {
         if (this.numeric === 'minus') this.numeric = byte === 48 ? 'zero' : 'integer';
         else if (this.numeric === 'zero') this.invalid = true;
@@ -109,6 +156,7 @@ class OversizedRecordHeader {
       if ((byte === 101 || byte === 69) && ['zero', 'integer', 'fraction'].includes(this.numeric)) { this.numeric = 'exponent'; return; }
       if ((byte === 43 || byte === 45) && this.numeric === 'exponent') { this.numeric = 'exponentSign'; return; }
       if (!this.finishNumber()) { this.invalid = true; return; }
+      this.finishOrdinal();
       this.mode = null;
     }
     if ([32, 9, 10, 13].includes(byte)) return;
@@ -137,11 +185,16 @@ class OversizedRecordHeader {
     }
     if (byte === 34) { this.mode = 'string'; this.capture = this.stringRole === 'type' ? [34] : null; return; }
     if (byte === 116 || byte === 102 || byte === 110) { this.mode = 'literal'; this.literal = byte === 116 ? 'true' : byte === 102 ? 'false' : 'null'; this.literalOffset = 1; return; }
-    if (byte === 45 || (byte >= 48 && byte <= 57)) { this.mode = 'number'; this.numeric = byte === 45 ? 'minus' : byte === 48 ? 'zero' : 'integer'; return; }
+    if (byte === 45 || (byte >= 48 && byte <= 57)) {
+      this.mode = 'number'; this.numeric = byte === 45 ? 'minus' : byte === 48 ? 'zero' : 'integer';
+      this.readingOrdinal = frame?.scope === 'root' && frame.key === 'ordinal';
+      this.ordinalNumber = this.readingOrdinal ? String.fromCharCode(byte) : null; return;
+    }
     this.invalid = true;
   }
-  finish(): { unrelated: boolean; clearModel: boolean; boundaryExcluded: boolean } {
-    const valid = !this.invalid && !this.frames.length && this.root === 'done' && (this.mode === null || (this.mode === 'number' && this.finishNumber())) && this.typeKeys === 1 && this.payloadKeys <= 1 && this.eventTypeKeys <= 1;
+  finish(): { unrelated: boolean; clearModel: boolean; boundaryExcluded: boolean; valid: boolean; type: string | null; eventType: string | null; ordinal: number | null } {
+    if (this.mode === 'number' && this.finishNumber()) this.finishOrdinal();
+    const valid = !this.invalid && !this.frames.length && this.root === 'done' && (this.mode === null || (this.mode === 'number' && this.finishNumber())) && this.typeKeys === 1 && this.payloadKeys <= 1 && this.eventTypeKeys <= 1 && this.ordinalKeys <= 1;
     const ordinaryEvent = this.topType === 'event_msg' && ['user_message', 'agent_message', 'agent_reasoning', 'agent_reasoning_raw_content', 'item_completed', 'task_started', 'task_complete', 'turn_aborted'].includes(this.eventType ?? '');
     const unrelated = valid && (this.topType === 'response_item' || this.topType === 'compacted' || ordinaryEvent);
     // Official RolloutItem variants have distinct root tags; their nested
@@ -150,7 +203,8 @@ class OversizedRecordHeader {
       'inter_agent_communication', 'inter_agent_communication_metadata', 'token_usage_record', 'retained_context',
       'security_risk_score', 'realtime_item'].includes(this.topType ?? '') ||
       this.topType === 'event_msg' && this.eventType !== null && this.eventType !== 'thread_settings_applied');
-    return { unrelated, boundaryExcluded, clearModel: !valid || this.topType === 'turn_context' || !['session_meta', 'event_msg', 'response_item', 'compacted'].includes(this.topType ?? '') };
+    return { unrelated, boundaryExcluded, valid, type: this.topType, eventType: this.eventType, ordinal: this.ordinalValue,
+      clearModel: !valid || this.topType === 'turn_context' || !['session_meta', 'event_msg', 'response_item', 'compacted'].includes(this.topType ?? '') };
   }
 }
 
@@ -192,6 +246,99 @@ async function fileMarker(handle: FileHandle, offset: number): Promise<string | 
   return createHash('sha256').update(first).update(last).digest('hex');
 }
 
+async function openRollout(root: string, path: string) {
+  const within = relative(resolve(root), resolve(path));
+  if (!within || within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)) throw new Error('Outside session root');
+  let directory = resolve(root);
+  for (const component of ['', ...dirname(within).split(sep).filter(part => part !== '.')]) {
+    if (component) directory = join(directory, component);
+    const info = await lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Linked session directory');
+  }
+  const file = await lstat(path);
+  if (!file.isFile() || file.isSymbolicLink()) throw new Error('Linked session file');
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || file.ino !== info.ino || file.dev !== info.dev) throw new Error('Session file changed');
+    return { handle, info };
+  } catch (error) { await handle.close(); throw error; }
+}
+
+async function canonicalMetadata(handle: FileHandle): Promise<any | null> {
+  const parts: Buffer[] = []; let size = 0, position = 0;
+  while (size <= 4_000_000) {
+    const buffer = Buffer.alloc(65_536), { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+    if (!bytesRead) return null;
+    const end = buffer.subarray(0, bytesRead).indexOf(10), part = buffer.subarray(0, end === -1 ? bytesRead : end);
+    parts.push(part); size += part.length; position += bytesRead;
+    if (size > 4_000_000) return null;
+    if (end !== -1) {
+      try { const row = JSON.parse(Buffer.concat(parts, size).toString('utf8')); return row.type === 'session_meta' ? selectedMetadata(row) : null; }
+      catch { return null; }
+    }
+  }
+  return null;
+}
+
+/** Read only the byte/ordinal prefix actually referenced by another rollout.
+ * Message values are never retained, and the prefix contributes no child use. */
+async function referencePrefix(root: string, path: string, reference: HistoryReference, accountId: string,
+  resolveParent: (metadata: any) => Promise<ReferenceBaseline | null>): Promise<ReferenceBaseline> {
+  if (physicalRolloutId(path) !== reference.thread_id) throw new Error('Physical reference mismatch');
+  const { handle, info } = await openRollout(root, path);
+  try {
+    if (info.size < reference.end_byte_offset) throw new Error('Truncated reference');
+    const lastByte = Buffer.alloc(1); await handle.read(lastByte, 0, 1, reference.end_byte_offset - 1);
+    if (lastByte[0] !== 10) throw new Error('Partial reference record');
+    const digest = createHash('sha256'); let metadata: any = null, parent: ReferenceBaseline | null = null;
+    let total = { ...ZERO }, atMs: number | null = null, expectedOrdinal: number | null = null;
+    let parts: Buffer[] = [], size = 0, header = new OversizedRecordHeader();
+    for await (const chunk of handle.createReadStream({ start: 0, end: reference.end_byte_offset - 1, autoClose: false })) {
+      digest.update(chunk); let start = 0;
+      while (start < chunk.length) {
+        const end = chunk.indexOf(10, start), stop = end === -1 ? chunk.length : end, part = chunk.subarray(start, stop);
+        header.feed(part); size += part.length;
+        if (size <= 4_000_000) parts.push(part); else parts = [];
+        if (end === -1) break;
+        const classification = header.finish();
+        if (!classification.valid || classification.ordinal === null) throw new Error('Invalid reference ordinal');
+        if (metadata === null) {
+          if (classification.type !== 'session_meta' || size > 4_000_000) throw new Error('Missing reference metadata');
+          metadata = selectedMetadata(JSON.parse(Buffer.concat(parts, size).toString('utf8'))).payload;
+          if (!validThreadId(metadata?.id) || canonicalRolloutId(path) !== metadata.id.toLowerCase() || metadata.creator_account_id !== accountId || metadata.history_mode !== 'paginated') throw new Error('Reference ownership mismatch');
+          if (metadata.history_base != null) {
+            if (!historyReference(metadata.history_base)) throw new Error('Invalid ancestor reference');
+            parent = await resolveParent(metadata); if (!parent) throw new Error('Unavailable ancestor');
+            total = { ...parent.total }; atMs = parent.atMs;
+          }
+          expectedOrdinal = parent?.reference.end_ordinal_exclusive ?? 0;
+        }
+        if (classification.ordinal !== expectedOrdinal || expectedOrdinal >= reference.end_ordinal_exclusive) throw new Error('Noncontiguous reference ordinal');
+        expectedOrdinal++;
+        if (classification.type === 'event_msg' && classification.eventType === 'token_count') {
+          if (size > 4_000_000) throw new Error('Unreadable reference counters');
+          const row = JSON.parse(Buffer.concat(parts, size).toString('utf8'));
+          if (row.payload.info != null) {
+            const next = normalizeCounters(row.payload.info.total_token_usage); if (!next) throw new Error('Invalid reference counters');
+            total = next;
+            const parsed = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
+            atMs = Number.isFinite(parsed) ? parsed : null;
+          }
+        } else if (!classification.boundaryExcluded && !(classification.type === 'event_msg' && classification.eventType === 'thread_settings_applied')) {
+          throw new Error('Unknown reference record');
+        }
+        parts = []; size = 0; header = new OversizedRecordHeader(); start = end + 1;
+      }
+    }
+    if (size || metadata === null || expectedOrdinal !== reference.end_ordinal_exclusive) throw new Error('Reference cutoff mismatch');
+    const after = await handle.stat();
+    if (after.ino !== info.ino || after.dev !== info.dev || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error('Reference changed during read');
+    return { reference, total, atMs, canonicalId: metadata.id.toLowerCase(), physicalIds: [reference.thread_id, ...(parent?.physicalIds ?? [])],
+      signature: createHash('sha256').update(digest.digest()).update(parent?.signature ?? '').digest('hex') };
+  } finally { await handle.close(); }
+}
+
 /** Retains only session identity, model metadata and token_count counters.
  * Ordinary conversation records are skipped; contents are never published or logged. */
 export class TokenLogState {
@@ -203,6 +350,10 @@ export class TokenLogState {
   complete = true;
   updatedAtMs: number | null = null;
   forkAmbiguous = false;
+  referenceHistoryVerified = false;
+  paginatedHistoryVerified = false;
+  referenceHistoryUnavailable = false;
+  private referenceBaseline: ReferenceBaseline | null = null;
   private hasMetadata = false;
   private ordinal = 0;
   private ownStartOrdinal: number | null = null;
@@ -219,6 +370,7 @@ export class TokenLogState {
   private pendingUncertainties: PeriodUncertainty[] = [];
 
   constructor(retainFromMs = Infinity) { this.periodRetainFromMs = retainFromMs; }
+  prepareReference(baseline: ReferenceBaseline | null): void { this.referenceBaseline = baseline; }
   retainPeriodFrom(startAtMs: number): void {
     this.periodRetainFromMs = startAtMs;
     this.periodEntries = this.periodEntries.filter(entry => entry.atMs >= startAtMs);
@@ -275,7 +427,10 @@ export class TokenLogState {
     return evidence;
   }
 
-  skipRecord(unrelated = false, clearModel = true): void {
+  skipRecord(unrelated = false, clearModel = true, recordedOrdinal: number | null = null): void {
+    if (this.paginatedHistoryVerified && recordedOrdinal !== this.ordinal) {
+      this.complete = false; this.forkAmbiguous = true; this.uncertain(this.rawAtMs, null);
+    }
     this.ordinal++;
     if (unrelated) return;
     // A skipped relevant record could hide the first child-owned marker. A
@@ -296,6 +451,12 @@ export class TokenLogState {
   }
 
   accept(line: string): void {
+    if (this.paginatedHistoryVerified) {
+      const header = new OversizedRecordHeader(); header.feed(Buffer.from(line)); const classification = header.finish();
+      if (!classification.valid || classification.ordinal !== this.ordinal) {
+        this.ordinal++; this.complete = false; this.forkAmbiguous = true; this.uncertain(this.rawAtMs, null); return;
+      }
+    }
     const ordinal = this.ordinal++;
     if (!/"type"\s*:\s*"(token_count|turn_context|session_meta|thread_settings_applied)"/.test(line)) {
       this.validateLegacyPrefix(line);
@@ -312,9 +473,27 @@ export class TokenLogState {
       this.hasMetadata = true;
       this.sessionId = typeof row.payload?.id === 'string' ? row.payload.id : null;
       this.creatorAccountId = typeof row.payload?.creator_account_id === 'string' ? row.payload.creator_account_id : null;
+      if (row.payload?.history_mode === 'paginated' && row.payload?.history_base == null) {
+        const header = new OversizedRecordHeader(); header.feed(Buffer.from(line));
+        const classification = header.finish();
+        if (ordinal === 0 && classification.valid && classification.ordinal === 0) this.paginatedHistoryVerified = true;
+        else { this.complete = false; this.forkAmbiguous = true; this.uncertain(null, null); }
+      }
       this.ownStartOrdinal = counter(row.payload?.subagent_history_start_ordinal);
       this.forked = row.payload?.forked_from_id != null || row.payload?.history_base != null || (this.ownStartOrdinal ?? 0) > 0;
-      this.forkAmbiguous = this.forked && this.ownStartOrdinal === null;
+      this.forkAmbiguous ||= this.forked && this.ownStartOrdinal === null;
+      if (row.payload?.history_base != null) {
+        const reference = historyReference(row.payload.history_base), baseline = this.referenceBaseline;
+        const header = new OversizedRecordHeader(); header.feed(Buffer.from(line)); const classification = header.finish();
+        if (ordinal === 0 && classification.valid && classification.ordinal === reference?.end_ordinal_exclusive && reference && baseline && row.payload.history_mode === 'paginated' && row.ordinal === reference.end_ordinal_exclusive &&
+          (row.payload.subagent_history_start_ordinal == null || this.ownStartOrdinal !== null) &&
+          JSON.stringify(reference) === JSON.stringify(baseline.reference) && Number.isSafeInteger(reference.end_ordinal_exclusive + 1)) {
+          this.referenceHistoryVerified = true; this.paginatedHistoryVerified = true; this.forkAmbiguous = false;
+          this.rawTotal = { ...baseline.total }; this.inheritedTotal = { ...baseline.total }; this.rawAtMs = baseline.atMs;
+          this.ordinal = reference.end_ordinal_exclusive + 1;
+          this.ownStartOrdinal = Math.max(this.ownStartOrdinal ?? this.ordinal, this.ordinal);
+        } else { this.referenceHistoryUnavailable = true; this.forkAmbiguous = true; this.complete = false; this.ownStartOrdinal = null; }
+      }
       this.awaitingLegacyForkBoundary = this.forkAmbiguous && validThreadId(this.sessionId) && validThreadId(row.payload?.forked_from_id) &&
         row.payload.forked_from_id.toLowerCase() !== this.sessionId.toLowerCase() &&
         row.payload?.history_base == null && row.payload?.subagent_history_start_ordinal == null &&
@@ -435,11 +614,14 @@ export class LocalTokenReader {
   inode: number | null = null;
   private device: number | null = null;
   private marker: string | null = null;
+  private referenceSignature: string | null = null;
+  referencePhysicalIds: string[] = [];
+  physicalId: string | null = null;
   private retainFromMs = Infinity;
   state = new TokenLogState();
   constructor(root = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'sessions')) { this.root = root; }
   reset(id: string | null): void {
-    this.id = id; this.path = null; this.offset = 0; this.inode = null; this.device = null; this.marker = null; this.state = new TokenLogState(this.retainFromMs);
+    this.id = id; this.path = null; this.offset = 0; this.inode = null; this.device = null; this.marker = null; this.referenceSignature = null; this.referencePhysicalIds = []; this.physicalId = null; this.state = new TokenLogState(this.retainFromMs);
   }
   preparePeriod(startAtMs: number): void {
     if (startAtMs < this.retainFromMs) {
@@ -469,27 +651,25 @@ export class LocalTokenReader {
       return await this.readPath(this.path, accountId, id);
     } catch { return { chat: null, errorCode: 'log_unavailable' }; }
   }
-  async readPath(path: string, accountId: string, expectedId: string | null = null): Promise<{ chat: ChatTokens | null; errorCode: string | null }> {
+  async readPath(path: string, accountId: string, expectedId: string | null = null, resolveReference?: ReferenceResolver): Promise<{ chat: ChatTokens | null; errorCode: string | null }> {
     let handle;
     try {
       if (this.path !== path) { this.reset(expectedId); this.path = path; }
-      const within = relative(resolve(this.root), resolve(path));
-      if (!within || within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)) throw new Error('Outside session root');
-      let directory = resolve(this.root);
-      for (const component of ['', ...dirname(within).split(sep).filter(part => part !== '.')]) {
-        if (component) directory = join(directory, component);
-        const info = await lstat(directory);
-        if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Linked session directory');
-      }
-      const file = await lstat(path);
-      if (!file.isFile() || file.isSymbolicLink()) throw new Error('Linked session file');
-      handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      const info = await handle.stat();
-      if (!info.isFile() || file.ino !== info.ino || file.dev !== info.dev) throw new Error('Session file changed');
+      const opened = await openRollout(this.root, path); handle = opened.handle; const info = opened.info;
       if (this.inode !== info.ino || this.device !== info.dev || info.size < this.offset ||
           (this.marker !== null && await fileMarker(handle, this.offset) !== this.marker)) {
         this.offset = 0; this.state = new TokenLogState(this.retainFromMs); this.inode = info.ino; this.device = info.dev; this.marker = null;
       }
+      const metadata = await canonicalMetadata(handle);
+      const referenced = metadata?.payload?.history_base != null;
+      const filenameVerified = validThreadId(metadata?.payload?.id) && canonicalRolloutId(path) === metadata.payload.id.toLowerCase();
+      const baseline = referenced && filenameVerified && metadata.payload.creator_account_id === accountId && resolveReference
+        ? await resolveReference(metadata.payload) : null;
+      const signature = referenced ? `${baseline?.signature ?? 'unavailable'}:${JSON.stringify(historyReference(metadata.payload.history_base))}` : null;
+      if (signature !== this.referenceSignature) {
+        this.offset = 0; this.marker = null; this.state = new TokenLogState(this.retainFromMs); this.referenceSignature = signature;
+      }
+      if (!this.offset) this.state.prepareReference(baseline);
       if (info.size > this.offset) {
         // Incremental JSONL parsing. Incomplete final records are reread next time.
         // Oversized unrelated records are skipped without retaining their contents.
@@ -506,13 +686,15 @@ export class LocalTokenReader {
             else if (!skipped) parts.push(part);
             if (end === -1) break;
             if (!skipped) this.state.accept(Buffer.concat(parts, size).toString('utf8'));
-            else { const classification = header!.finish(); this.state.skipRecord(classification.unrelated, classification.clearModel); }
+            else { const classification = header!.finish(); this.state.skipRecord(classification.unrelated, classification.clearModel, classification.valid ? classification.ordinal : null); }
             this.offset = position + end + 1;
             parts = []; size = 0; skipped = false; header = null; start = end + 1;
           }
           position += chunk.length;
         }
       }
+      this.referencePhysicalIds = this.state.referenceHistoryVerified ? baseline?.physicalIds ?? [] : [];
+      this.physicalId = filenameVerified && this.state.paginatedHistoryVerified ? physicalRolloutId(path) : null;
       this.marker = await fileMarker(handle, this.offset);
       if (!validThreadId(this.state.sessionId) || (expectedId !== null && this.state.sessionId !== expectedId) || this.state.creatorAccountId !== accountId) return { chat: null, errorCode: 'log_identity_mismatch' };
       if (this.state.forkAmbiguous) return { chat: null, errorCode: 'account_logs_incomplete' };
@@ -566,61 +748,128 @@ export class AccountTokenReader {
     for (const directory of ['sessions', 'archived_sessions']) incomplete = await this.discover(join(this.root, directory), files) || incomplete;
     const available = new Set(files);
     for (const path of this.readers.keys()) if (!available.has(path)) this.readers.delete(path);
-    const sessions = new Map<string, { chat: ChatTokens | null; reader: LocalTokenReader }>();
-    const periodCopies = new Map<string, LocalTokenReader[]>();
+    const physicalFiles = new Map<string, string[]>();
+    for (const path of files) {
+      const physicalId = physicalRolloutId(path); if (!physicalId) continue;
+      const copies = physicalFiles.get(physicalId) ?? []; copies.push(path); physicalFiles.set(physicalId, copies);
+    }
+    // Only discovered physical IDs can be resolved. Successful bounded prefixes
+    // are shared within this poll, and rehashed on the next poll.
+    const resolvedPrefixes = new Map<string, ReferenceBaseline>();
+    const resolveReference = async (metadata: any, visited: Set<string>): Promise<ReferenceBaseline | null> => {
+      const reference = historyReference(metadata.history_base);
+      if (!reference || metadata.history_mode !== 'paginated' || metadata.creator_account_id !== accountId ||
+          visited.has(reference.thread_id) || visited.size >= MAX_REFERENCE_DEPTH || !validThreadId(metadata.id) ||
+          metadata.forked_from_id != null && !validThreadId(metadata.forked_from_id)) return null;
+      const matchesOwner = (baseline: ReferenceBaseline) => baseline.canonicalId === metadata.id.toLowerCase() ||
+        validThreadId(metadata.forked_from_id) && baseline.canonicalId === metadata.forked_from_id.toLowerCase();
+      const key = JSON.stringify(reference), cached = resolvedPrefixes.get(key);
+      if (cached) return visited.size + cached.physicalIds.length > MAX_REFERENCE_DEPTH || cached.physicalIds.some(id => visited.has(id)) || !matchesOwner(cached) ? null : cached;
+      const paths = physicalFiles.get(reference.thread_id); if (!paths?.length) return null;
+      const ancestors = new Set(visited); ancestors.add(reference.thread_id);
+      let baseline: ReferenceBaseline | null = null;
+      for (const path of paths) {
+        try {
+          const candidate = await referencePrefix(this.root, path, reference, accountId, parent => resolveReference(parent, ancestors));
+          if (baseline && (candidate.signature !== baseline.signature || candidate.canonicalId !== baseline.canonicalId)) return null;
+          baseline = candidate;
+        } catch { return null; }
+      }
+      if (baseline) resolvedPrefixes.set(key, baseline);
+      return baseline && matchesOwner(baseline) ? baseline : null;
+    };
+    type ReadCopy = { chat: ChatTokens | null; reader: LocalTokenReader };
+    const sessions = new Map<string, ReadCopy[]>();
+    const trustedPhysicalIds = new Set<string>();
     const discoveryIncomplete = incomplete;
     let unreadableFileIncomplete = false;
     for (const path of files) {
       let reader = this.readers.get(path);
       if (!reader) { reader = new LocalTokenReader(this.root); this.readers.set(path, reader); }
       if (!periodErrorCode) reader.preparePeriod(window!.startAtMs);
-      const result = await reader.readPath(path, accountId);
+      const physicalId = physicalRolloutId(path);
+      const result = await reader.readPath(path, accountId, null,
+        metadata => resolveReference(metadata, new Set(physicalId ? [physicalId] : [])));
       if (result.errorCode === 'log_unavailable') unreadableFileIncomplete = true;
       if (result.errorCode === 'account_logs_incomplete' || result.errorCode === 'log_unavailable') incomplete = true;
       if (reader.state.creatorAccountId === accountId && !reader.state.complete) incomplete = true;
       if (reader.state.creatorAccountId !== accountId || !validThreadId(reader.state.sessionId)) continue;
-      const sessionId = reader.state.sessionId.toLowerCase(), previous = sessions.get(sessionId);
-      const copies = periodCopies.get(sessionId) ?? []; copies.push(reader); periodCopies.set(sessionId, copies);
-      // Active/archived copies and renamed rollouts share a canonical thread ID.
-      // Keep one cumulative snapshot rather than summing the copies.
-      const score = result.chat?.totalTokens ?? 0, previousScore = previous?.chat?.totalTokens ?? 0;
-      if (!previous || score > previousScore ||
-          (score === previousScore && result.chat?.complete && !previous.chat?.complete)) sessions.set(sessionId, { chat: result.chat, reader });
+      const sessionId = reader.state.sessionId.toLowerCase(), copies = sessions.get(sessionId) ?? [];
+      copies.push({ chat: result.chat, reader }); sessions.set(sessionId, copies);
+      if (reader.state.referenceHistoryVerified && reader.physicalId) {
+        trustedPhysicalIds.add(reader.physicalId);
+        for (const id of reader.referencePhysicalIds) trustedPhysicalIds.add(id);
+      }
     }
     if (!sessions.size) return unavailable(incomplete ? 'account_logs_incomplete' : 'no_token_events');
-    const chats = [...sessions.values()].flatMap(session => session.chat ? [session.chat] : []);
+    // Legacy copies still share a canonical cumulative counter. Verified
+    // reference lineages instead have disjoint physical suffixes, including
+    // requests abandoned by a rollback. Deduplicate copies within each suffix.
+    const partitions = [...sessions.values()].map(copies => {
+      const groups = new Map<string, ReadCopy[]>();
+      for (const copy of copies) {
+        const id = copy.reader.physicalId;
+        const key = id && trustedPhysicalIds.has(id) ? id : 'canonical-copy';
+        const members = groups.get(key) ?? []; members.push(copy); groups.set(key, members);
+      }
+      const ambiguous = groups.size > 1 && groups.has('canonical-copy');
+      incomplete ||= ambiguous;
+      // A legacy or renamed cumulative copy cannot establish another physical
+      // suffix. Fall back to the canonical subtotal and withhold a full price.
+      return { groups: ambiguous ? [copies] : [...groups.values()], ambiguous };
+    });
+    const chats: ChatTokens[] = [];
+    for (const { groups } of partitions) {
+      const selected = groups.flatMap(copies => {
+        const candidates = copies.flatMap(copy => copy.chat ? [copy.chat] : []);
+        candidates.sort((a, b) => b.totalTokens - a.totalTokens || Number(b.complete) - Number(a.complete));
+        return candidates.slice(0, 1);
+      });
+      const chat = selected.length ? aggregate(selected) : null;
+      if (selected.length && !chat) return unavailable('counter_overflow');
+      if (chat) chats.push(chat);
+    }
     const account = chats.length ? aggregate(chats, incomplete) : null;
     const errorCode = chats.length && !account ? 'counter_overflow' : incomplete ? 'account_logs_incomplete' : !chats.length ? 'no_token_events' : null;
     if (periodErrorCode) return { account, errorCode, period: null, periodErrorCode };
     const periods: ChatTokens[] = [];
     let excludedReviewTokens = 0;
-    let periodIncomplete = discoveryIncomplete || unreadableFileIncomplete;
-    for (const copies of periodCopies.values()) {
-      const candidates = copies.map(reader => ({ reader, snapshot: reader.state.periodSnapshot(window!, now) }));
-      if (candidates.some(candidate => !candidate.snapshot)) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
-      candidates.sort((a, b) => b.snapshot!.totalTokens - a.snapshot!.totalTokens ||
-        b.snapshot!.excludedReviewTokens - a.snapshot!.excludedReviewTokens || Number(b.snapshot!.complete) - Number(a.snapshot!.complete));
-      const selected = candidates[0], snapshot = selected.snapshot!;
-      // Keep one verified review subtotal per canonical session, including when
-      // the fullest review copy differs from the fullest paid copy.
-      const reviewSubtotal = Math.max(...candidates.map(candidate => candidate.snapshot!.excludedReviewTokens));
-      const reviewTotal = counter(excludedReviewTokens + reviewSubtotal);
-      if (reviewTotal === null) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
-      excludedReviewTokens = reviewTotal;
-      const evidence = selected.reader.state.periodEvidence(window!, now);
-      for (const candidate of candidates) {
-        periodIncomplete ||= !candidate.snapshot!.complete;
-        if (candidate === selected || !candidate.snapshot!.totalTokens) continue;
-        // A larger cumulative lifetime value need not contain a rewritten
-        // current-period rollout. Verify current request evidence independently.
-        for (const [key, occurrences] of candidate.reader.state.periodEvidence(window!, now)) {
-          if ((evidence.get(key) ?? 0) < occurrences) { periodIncomplete = true; break; }
+    let periodIncomplete = discoveryIncomplete || unreadableFileIncomplete, referenceUnavailable = false;
+    for (const { groups, ambiguous } of partitions) {
+      const sessionPeriods: ChatTokens[] = [];
+      for (const copies of groups) {
+        const candidates = copies.map(copy => ({ reader: copy.reader, snapshot: copy.reader.state.periodSnapshot(window!, now) }));
+        if (candidates.some(candidate => !candidate.snapshot)) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
+        candidates.sort((a, b) => b.snapshot!.totalTokens - a.snapshot!.totalTokens ||
+          b.snapshot!.excludedReviewTokens - a.snapshot!.excludedReviewTokens || Number(b.snapshot!.complete) - Number(a.snapshot!.complete));
+        const selected = candidates[0], snapshot = selected.snapshot!;
+        periodIncomplete ||= ambiguous && candidates.some(candidate => candidate.snapshot!.totalTokens > 0);
+        const reviewSubtotal = Math.max(...candidates.map(candidate => candidate.snapshot!.excludedReviewTokens));
+        const reviewTotal = counter(excludedReviewTokens + reviewSubtotal);
+        if (reviewTotal === null) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
+        excludedReviewTokens = reviewTotal;
+        const evidence = selected.reader.state.periodEvidence(window!, now);
+        for (const candidate of candidates) {
+          periodIncomplete ||= !candidate.snapshot!.complete;
+          referenceUnavailable ||= !candidate.snapshot!.complete && candidate.reader.state.referenceHistoryUnavailable;
+          if (candidate === selected || !candidate.snapshot!.totalTokens) continue;
+          // Different copies of the same physical suffix must contain the
+          // selected paid evidence. Distinct physical requests are never merged
+          // merely because their counters and timestamps happen to match.
+          for (const [key, occurrences] of candidate.reader.state.periodEvidence(window!, now)) {
+            if ((evidence.get(key) ?? 0) < occurrences) { periodIncomplete = true; break; }
+          }
         }
+        if (snapshot.totalTokens > 0) sessionPeriods.push(snapshot);
       }
-      if (snapshot.totalTokens > 0) periods.push(snapshot);
+      if (sessionPeriods.length) {
+        const session = aggregate(sessionPeriods);
+        if (!session) return { account, errorCode, period: null, periodErrorCode: 'counter_overflow' };
+        periods.push(session);
+      }
     }
     const summed = aggregate(periods, periodIncomplete);
     return { account, errorCode, period: summed ? { ...summed, excludedReviewTokens, window: { ...window! } } : null,
-      periodErrorCode: !summed ? 'counter_overflow' : periodIncomplete ? 'period_logs_incomplete' : null };
+      periodErrorCode: !summed ? 'counter_overflow' : periodIncomplete ? referenceUnavailable ? 'reference_history_unavailable' : 'period_logs_incomplete' : null };
   }
 }

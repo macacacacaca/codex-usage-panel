@@ -47,6 +47,12 @@ Legacy copied forks can omit `subagent_history_start_ordinal`. Codex writes a `t
 
 A missing, invalid, or foreign-thread marker leaves the fork unverified and USD unavailable. The marker resolves only an initially missing boundary; later settings events cannot clear real request gaps or ambiguity from an explicit numeric boundary. Regression tests cover copied current-period counters, incremental marker arrival, model changes, owner mismatches, and post-boundary counter gaps. Previously downloaded v0.3.6 release apps require rebuilding to include this fix.
 
+### Referenced History and Rollback
+
+Paginated rollouts can inherit a bounded prefix through `history_base` instead of copying the prefix locally. This can be a continuation or rollback of the same logical chat; the reference identifies a physical rollout, whose ID may differ from the chat ID. Source builds validate the discovered source file, account ownership, byte and ordinal boundaries, and reference ancestry before restoring the cumulative counter baseline. The inherited prefix is not charged again as new consumption.
+
+Separate physical continuations of one chat retain their distinct paid requests. If source history contains requests A and B, and a continuation rolls back to A before making request C, actual consumption includes A, B, and C once each. Exact copies of a physical rollout are deduplicated separately. Missing or unsafe sources, invalid cutoffs, cycles, and unresolved request counters keep estimates unavailable. Tests use synthetic reference chains, rollback branches, archive copies, and invalid references; private session files are never fixtures.
+
 ### Excluded Safety Reviews
 
 OpenAI's ChatGPT sign-in policy makes auto-review safety checks free and exempt from plan limits. [Official policy](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan). The reader excludes only the exact model ID `codex-auto-review` from current-period counters and pricing segments, while recording its verified in-period token total as `excludedReviewTokens` for details. Account, timestamp, and interval checks determine that separate period total. Version 0.3.6 also prevents a verified, exact free-review delta with no timestamp from creating paid-pricing uncertainty; it is not added to `excludedReviewTokens` because its interval cannot be established. Raw cumulative counters remain the verification baseline. Period `.complete` describes paid-request coverage; actual paid or ambiguous deltas remain conservative.
